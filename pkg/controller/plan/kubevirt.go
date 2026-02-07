@@ -861,6 +861,9 @@ func getDiskIndex(pvc *core.PersistentVolumeClaim) int {
 }
 
 // Return PersistentVolumeClaims associated with a VM.
+// If a PVC has a target PVC that is bound,
+// this method filters out the original PVC (since the target PVC will also be in the list).
+// It also copies necessary annotations from original to target PVC for mapDisks to work.
 func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, err error) {
 	pvcsList := &core.PersistentVolumeClaimList{}
 	// Add VM uuid
@@ -896,11 +899,59 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 		return
 	}
 
-	pvcs = make([]*core.PersistentVolumeClaim, len(pvcsList.Items))
-	for i, pvc := range pvcsList.Items {
-		// loopvar
-		pvc := pvc
-		pvcs[i] = &pvc
+	// Build a map of intermediate PVCs that have bound target PVCs (to filter them out)
+	// and collect annotations to copy to target PVCs
+	intermediatePVCsToSkip := make(map[string]bool)
+	intermediateAnnotations := make(map[string]map[string]string) // targetPVCName -> annotations to copy
+
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+		if targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]; targetPVCName != "" {
+			// This is an intermediate PVC with a target PVC
+			// Check if target PVC is bound
+			targetPVC := &core.PersistentVolumeClaim{}
+			targetErr := r.Destination.Client.Get(
+				context.TODO(),
+				client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+				targetPVC)
+			if targetErr == nil && targetPVC.Status.Phase == core.ClaimBound {
+				// Target PVC is bound, mark intermediate PVC to be skipped
+				intermediatePVCsToSkip[pvc.Name] = true
+				// Store ALL annotations to copy to target PVC (not just specific ones)
+				// This ensures annotations like AnnSourceFormat are preserved for ImageConversion
+				intermediateAnnotations[targetPVCName] = make(map[string]string)
+				for k, v := range pvc.Annotations {
+					// Copy all annotations except internal ones
+					if !strings.HasPrefix(k, "forklift.konveyor.io/target-") {
+						intermediateAnnotations[targetPVCName][k] = v
+					}
+				}
+			}
+		}
+	}
+
+	pvcs = make([]*core.PersistentVolumeClaim, 0, len(pvcsList.Items))
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+
+		// Skip intermediate PVCs that have bound target PVCs
+		if intermediatePVCsToSkip[pvc.Name] {
+			continue
+		}
+
+		// If this is a target PVC, copy annotations from its intermediate source
+		if annotations, ok := intermediateAnnotations[pvc.Name]; ok {
+			if pvc.Annotations == nil {
+				pvc.Annotations = make(map[string]string)
+			}
+			for k, v := range annotations {
+				if _, exists := pvc.Annotations[k]; !exists {
+					pvc.Annotations[k] = v
+				}
+			}
+		}
+
+		pvcs = append(pvcs, pvc)
 	}
 
 	// Sort the pvcs slice by disk index
@@ -911,6 +962,71 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 	})
 
 	return
+}
+
+// DeleteIntermediatePVCs deletes intermediate PVCs that have been replaced by bound target PVCs.
+// Only deletes PVCs that have "forklift.konveyor.io/target-pvc-name" annotation. If a PVC doesn't have this annotation, it's skipped.
+// This should be called after the VM is created with target PVCs.
+func (r *KubeVirt) DeleteIntermediatePVCs(vm *plan.VMStatus) error {
+	pvcsList := &core.PersistentVolumeClaimList{}
+	labelSelector := map[string]string{
+		kVM: vm.Ref.ID,
+	}
+	if r.Plan.Spec.Type != api.MigrationOnlyConversion {
+		labelSelector[kMigration] = string(r.Migration.UID)
+	}
+	err := r.Destination.Client.List(
+		context.TODO(),
+		pvcsList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(labelSelector),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+		targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]
+		if targetPVCName == "" {
+			continue
+		}
+
+		// Check if target PVC is bound
+		targetPVC := &core.PersistentVolumeClaim{}
+		err := r.Destination.Client.Get(
+			context.TODO(),
+			client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+			targetPVC)
+		if err != nil {
+			r.Log.Error(err, "Failed to get target PVC", "pvc", targetPVCName)
+			continue
+		}
+
+		if targetPVC.Status.Phase != core.ClaimBound {
+			r.Log.Info("Target PVC not bound yet, skipping intermediate PVC deletion",
+				"intermediatePVC", pvc.Name,
+				"targetPVC", targetPVCName,
+				"phase", targetPVC.Status.Phase)
+			continue
+		}
+
+		// Delete the intermediate PVC
+		r.Log.Info("Deleting intermediate PVC replaced by target PVC",
+			"intermediatePVC", pvc.Name,
+			"targetPVC", targetPVCName)
+		err = r.Destination.Client.Delete(context.TODO(), pvc)
+		if err != nil {
+			if !k8serr.IsNotFound(err) {
+				r.Log.Error(err, "Failed to delete intermediate PVC", "pvc", pvc.Name)
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // Creates the PVs and PVCs for LUN disks.
