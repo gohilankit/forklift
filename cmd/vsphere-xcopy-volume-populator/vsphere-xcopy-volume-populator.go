@@ -222,6 +222,15 @@ func main() {
 				klog.Fatal(q)
 			}
 
+			// Call OnComplete if the storage API supports it
+			if onCompleteCapable, ok := storageApi.(populator.OnCompleteCapable); ok {
+				klog.Info("Storage API supports OnComplete, calling it")
+				if err := onCompleteCapable.OnComplete(ownerName, targetNamespace); err != nil {
+					klog.Errorf("OnComplete failed: %v", err)
+					// Don't fail the entire operation, just log the error
+				}
+			}
+
 			return
 		}
 	}

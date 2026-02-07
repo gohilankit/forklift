@@ -61,3 +61,11 @@ type MappingContext map[string]any
 type SciniAware interface {
 	SciniRequired() bool
 }
+
+// OnCompleteCapable defines storage that needs to perform actions after successful copy
+// This is an optional interface - only storage vendors that need post-copy actions should implement it
+type OnCompleteCapable interface {
+	// OnComplete is called after successful copy operation
+	// It receives the PVC name, namespace, and UID for any post-processing
+	OnComplete(pvcName, pvcNamespace string) error
+}

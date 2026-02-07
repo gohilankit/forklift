@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/fcutil"
 	"github.com/kubev2v/forklift/cmd/vsphere-xcopy-volume-populator/internal/populator"
@@ -15,6 +17,15 @@ import (
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -408,4 +419,253 @@ func (f *FlashArrayClonner) performVolumeCopy(sourceVolumeName, targetVolumeName
 
 	progress <- 100
 	return nil
+}
+
+// getKubeConfig returns the Kubernetes configuration
+func getKubeConfig() (*rest.Config, error) {
+	// Try in-cluster config first
+	cfg, err := rest.InClusterConfig()
+	if err == nil {
+		return cfg, nil
+	}
+
+	// Fall back to kubeconfig file
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
+	}
+
+	return clientcmd.BuildConfigFromFlags("", kubeconfig)
+}
+
+// getKubeClient returns a Kubernetes clientset
+func getKubeClient() (*kubernetes.Clientset, error) {
+	cfg, err := getKubeConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
+	}
+
+	coreCfg := rest.CopyConfig(cfg)
+	coreCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	return kubernetes.NewForConfig(coreCfg)
+}
+
+// OnComplete implements the OnCompleteCapable interface
+// This is called after successful FADA copy to create PortworxVolumePopulator CR for PXD handoff
+func (f *FlashArrayClonner) OnComplete(pvcName, pvcNamespace string) error {
+	klog.Infof("Pure FlashArray: OnComplete called for PVC %s/%s", pvcNamespace, pvcName)
+
+	// Get Kubernetes client
+	clientSet, err := getKubeClient()
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	// Get the FADA PVC
+	fadaPVC, err := clientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Get(
+		context.Background(), pvcName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get FADA PVC %s: %w", pvcName, err)
+	}
+
+	// Check if target storage class annotation is present
+	targetStorageClass, hasTargetSC := fadaPVC.Annotations["forklift.konveyor.io/target-storage-class"]
+	if !hasTargetSC {
+		klog.Info("Pure FlashArray: No target storage class annotation found, skipping PXD PVC creation")
+		return nil
+	}
+
+	klog.Infof("Pure FlashArray: Found target storage class annotation: %s, creating PXD PVC", targetStorageClass)
+
+	// Create PXD PVC with the target storage class
+	pxdPVCName, err := f.createPXDPVC(clientSet, fadaPVC, targetStorageClass, pvcNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to create PXD PVC: %w", err)
+	}
+
+	klog.Infof("Pure FlashArray: Successfully created PXD PVC: %s", pxdPVCName)
+
+	// Get PXD PVC to extract dataSourceRef name
+	// Retry with backoff since the PVC might take time to appear in API server
+	var pxdPVC *corev1.PersistentVolumeClaim
+	var getPVCErr error
+	maxRetries := 10
+	for i := 0; i < maxRetries; i++ {
+		pxdPVC, getPVCErr = clientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Get(
+			context.Background(), pxdPVCName, metav1.GetOptions{})
+		if getPVCErr == nil {
+			klog.Infof("Pure FlashArray: Successfully retrieved PXD PVC %s", pxdPVCName)
+			break
+		}
+		if !k8serr.IsNotFound(getPVCErr) {
+			return fmt.Errorf("failed to get PXD PVC %s: %w", pxdPVCName, getPVCErr)
+		}
+		klog.Infof("Pure FlashArray: PXD PVC %s not found yet, retrying (%d/%d)...", pxdPVCName, i+1, maxRetries)
+		// Exponential backoff: 1s, 2s, 4s, 8s, etc.
+		time.Sleep(time.Duration(1<<uint(i)) * time.Second)
+	}
+	if getPVCErr != nil {
+		return fmt.Errorf("failed to get PXD PVC %s after %d retries: %w", pxdPVCName, maxRetries, getPVCErr)
+	}
+
+	if pxdPVC.Spec.DataSourceRef == nil || pxdPVC.Spec.DataSourceRef.Name == "" {
+		return fmt.Errorf("PXD PVC %s has no dataSourceRef", pxdPVCName)
+	}
+
+	populatorName := pxdPVC.Spec.DataSourceRef.Name
+	klog.Infof("Pure FlashArray: Creating PortworxVolumePopulator CR: %s", populatorName)
+
+	// Create Kubernetes config
+	cfg, err := getKubeConfig()
+	if err != nil {
+		return fmt.Errorf("failed to build config: %w", err)
+	}
+
+	// Create dynamic client for custom resources
+	dynClient, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	// Define PortworxVolumePopulator GVR
+	gvr := schema.GroupVersionResource{
+		Group:    "forklift.konveyor.io",
+		Version:  "v1beta1",
+		Resource: "portworxvolumepopulators",
+	}
+
+	// Extract secret name from FADA PVC annotations
+	secretName := fadaPVC.Annotations["forklift.konveyor.io/secret"]
+	if secretName == "" {
+		klog.Warning("Pure FlashArray: No secret annotation found on FADA PVC, using empty secretName")
+	}
+
+	// Create PortworxVolumePopulator CR
+	portworxPopulator := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "forklift.konveyor.io/v1beta1",
+			"kind":       "PortworxVolumePopulator",
+			"metadata": map[string]interface{}{
+				"name":      populatorName,
+				"namespace": pvcNamespace,
+				"labels": map[string]interface{}{
+					"migration":    fadaPVC.Labels["migration"],
+					"vmID":         fadaPVC.Labels["vmID"],
+					"vmdkKey":      fadaPVC.Labels["vmdkKey"],
+					"storage-type": "portworx",
+				},
+				"ownerReferences": []interface{}{
+					map[string]interface{}{
+						"apiVersion": "v1",
+						"kind":       "PersistentVolumeClaim",
+						"name":       pxdPVCName,
+						"uid":        string(pxdPVC.UID),
+					},
+				},
+			},
+			"spec": map[string]interface{}{
+				"sourcePvc":       pvcName,
+				"sourceNamespace": pvcNamespace,
+				"secretName":      secretName,
+			},
+		},
+	}
+
+	_, err = dynClient.Resource(gvr).Namespace(pvcNamespace).Create(
+		context.Background(), portworxPopulator, metav1.CreateOptions{})
+	if err != nil {
+		// Check if already exists
+		if k8serr.IsAlreadyExists(err) {
+			klog.Infof("Pure FlashArray: PortworxVolumePopulator CR already exists: %s", populatorName)
+			return nil
+		}
+		return fmt.Errorf("failed to create PortworxVolumePopulator CR: %w", err)
+	}
+
+	klog.Infof("Pure FlashArray: Successfully created PortworxVolumePopulator CR: %s", populatorName)
+
+	// Mark FADA PVC as needing rebinding by adding target PVC annotation
+	if fadaPVC.Annotations == nil {
+		fadaPVC.Annotations = make(map[string]string)
+	}
+	fadaPVC.Annotations["forklift.konveyor.io/target-pvc-name"] = pxdPVCName
+
+	_, err = clientSet.CoreV1().PersistentVolumeClaims(pvcNamespace).Update(
+		context.Background(), fadaPVC, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to update FADA PVC annotations: %w", err)
+	}
+
+	klog.Infof("Pure FlashArray: Marked FADA PVC %s for rebinding to target PVC %s", pvcName, pxdPVCName)
+	return nil
+}
+
+// createPXDPVC creates a PXD PVC with the target storage class
+// It copies all labels and annotations from the FADA PVC except forklift.konveyor.io/target-storage-class
+func (f *FlashArrayClonner) createPXDPVC(clientSet *kubernetes.Clientset, fadaPVC *corev1.PersistentVolumeClaim, targetStorageClass, namespace string) (string, error) {
+	// Generate PXD PVC name
+	pxdPVCName := "pxd-" + fadaPVC.Name
+
+	klog.Infof("Pure FlashArray: Creating PXD PVC %s with storage class %s", pxdPVCName, targetStorageClass)
+
+	// Copy labels from FADA PVC
+	labels := make(map[string]string)
+	for k, v := range fadaPVC.Labels {
+		labels[k] = v
+	}
+
+	// Copy annotations from FADA PVC, excluding target-storage-class
+	annotations := make(map[string]string)
+	for k, v := range fadaPVC.Annotations {
+		if k != "forklift.konveyor.io/target-storage-class" {
+			annotations[k] = v
+		}
+	}
+
+	// Get the storage size from FADA PVC
+	storageSize := fadaPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+
+	// Create PXD PVC
+	pxdPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        pxdPVCName,
+			Namespace:   namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      fadaPVC.Spec.AccessModes,
+			StorageClassName: &targetStorageClass,
+			VolumeMode:       fadaPVC.Spec.VolumeMode,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: storageSize,
+				},
+			},
+			DataSourceRef: &corev1.TypedObjectReference{
+				APIGroup: stringPtr("forklift.konveyor.io"),
+				Kind:     "PortworxVolumePopulator",
+				Name:     pxdPVCName, // Will be the name of the PortworxVolumePopulator CR
+			},
+		},
+	}
+
+	// Create the PXD PVC
+	createdPVC, err := clientSet.CoreV1().PersistentVolumeClaims(namespace).Create(
+		context.Background(), pxdPVC, metav1.CreateOptions{})
+	if err != nil {
+		if k8serr.IsAlreadyExists(err) {
+			klog.Infof("Pure FlashArray: PXD PVC %s already exists", pxdPVCName)
+			return pxdPVCName, nil
+		}
+		return "", fmt.Errorf("failed to create PXD PVC %s: %w", pxdPVCName, err)
+	}
+
+	klog.Infof("Pure FlashArray: Successfully created PXD PVC %s (UID: %s)", pxdPVCName, createdPVC.UID)
+	return pxdPVCName, nil
+}
+
+// stringPtr returns a pointer to the given string
+func stringPtr(s string) *string {
+	return &s
 }

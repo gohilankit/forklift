@@ -21,6 +21,7 @@ import (
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/plan/migrator"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler"
+	"github.com/kubev2v/forklift/pkg/controller/plan/storage"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
@@ -73,6 +74,8 @@ type Migration struct {
 	converter *adapter.Converter
 	// vm migrator
 	migrator migrator.Migrator
+	// storage rebinder (optional, set based on storage backend detection)
+	storageRebinder storage.Rebinder
 }
 
 // Type of migration.
@@ -178,6 +181,10 @@ func (r *Migration) init() (err error) {
 		return
 	}
 	r.migrator, err = migrator.New(r.Context)
+	if err != nil {
+		return
+	}
+	r.storageRebinder, err = storage.NewRebinder(r.Context)
 	if err != nil {
 		return
 	}
@@ -983,6 +990,20 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				break
 			}
 			if step.MarkedCompleted() && !step.HasError() {
+				// Perform storage-backend-specific volume rebinding if needed
+				// This is only required for certain storage backends (e.g., Pure/Portworx)
+				if r.storageRebinder != nil {
+					pvcs, err := r.kubevirt.getPVCs(vm.Ref)
+					if err == nil && r.storageRebinder.NeedsRebinding(vm.Ref, pvcs) {
+						err = r.storageRebinder.RebindVolumes(vm.Ref, string(r.Migration.UID))
+						if err != nil {
+							step.AddError(err.Error())
+							err = nil
+							break
+						}
+					}
+				}
+
 				if r.Plan.IsWarm() {
 					now := meta.Now()
 					next := meta.NewTime(now.Add(time.Duration(Settings.PrecopyInterval) * time.Minute))
@@ -1894,6 +1915,48 @@ func (r *Migration) updatePopulatorCopyProgress(vm *plan.VMStatus, step *plan.St
 			continue
 		}
 
+		// Check if this PVC has a target PVC for rebinding and is bound
+		targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]
+
+		if targetPVCName != "" {
+			// This PVC needs to be replaced by a target PVC
+			// Check if target PVC is bound to mark task complete
+			targetPVC := &core.PersistentVolumeClaim{}
+			err = r.Destination.Client.Get(
+				context.TODO(),
+				client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+				targetPVC)
+			if err != nil {
+				// Target PVC not found yet, keep waiting
+				r.Log.Info("Waiting for target PVC to be created",
+					"sourcePVC", pvc.Name,
+					"targetPVC", targetPVCName)
+				continue
+			}
+
+			if targetPVC.Status.Phase == core.ClaimBound {
+				// Target PVC is bound, mark task as completed
+				// Actual rebinding will happen after step completes
+				r.Log.Info("Target PVC is bound, marking task complete",
+					"sourcePVC", pvc.Name,
+					"targetPVC", targetPVCName)
+
+				task.Phase = api.StepCompleted
+				task.Reason = TransferCompleted
+				task.Progress.Completed = task.Progress.Total
+				task.MarkCompleted()
+				continue
+			} else {
+				// Target PVC exists but not bound yet, keep waiting
+				r.Log.Info("Waiting for target PVC to bind",
+					"targetPVC", targetPVCName,
+					"phase", targetPVC.Status.Phase)
+				// TODO: Get progress from volume populator status if available
+				continue
+			}
+		}
+
+		// Normal PVC flow (no rebinding needed)
 		if pvc.Status.Phase == core.ClaimBound {
 			task.Phase = api.StepCompleted
 			task.Reason = TransferCompleted

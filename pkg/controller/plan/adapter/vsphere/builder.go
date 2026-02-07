@@ -41,6 +41,7 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 	core "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1391,6 +1392,21 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 						"the offload plugin configuration has missing details, cannot continue with PVC and populator resource creation")
 				}
 
+				// Check if destination StorageClass is non-FADA for Pure FlashArray
+				var targetStorageClass string
+				if storageVendorProduct == api.StorageVendorProductPureFlashArray {
+					isFADA, err := r.isStorageClassFADA(storageClass)
+					if err != nil {
+						r.Log.Error(err, "Failed to check if StorageClass is FADA, assuming it is FADA", "storageClass", storageClass)
+					} else if !isFADA {
+						// Non-FADA destination detected, will need PXD handoff
+						targetStorageClass = storageClass
+						storageClass = "fada"
+						r.Log.Info("Detected non-FADA destination StorageClass for Pure FlashArray, will use FADA intermediate storage",
+							"targetStorageClass", targetStorageClass)
+					}
+				}
+
 				namespace := r.Plan.Spec.TargetNamespace
 				labels := map[string]string{
 					"migration": string(r.Migration.UID),
@@ -1437,6 +1453,14 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				}
 				pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
 				pvc.Annotations["copy-offload"] = baseVolume(disk.File, r.Plan.IsWarm())
+
+				// Add target storage class annotation for non-FADA Pure FlashArray destinations
+				if targetStorageClass != "" {
+					pvc.Annotations["forklift.konveyor.io/target-storage-class"] = targetStorageClass
+					r.Log.Info("Added target storage class annotation for PXD handoff",
+						"pvc", pvc.Name,
+						"targetStorageClass", targetStorageClass)
+				}
 
 				// Apply PVC template naming if configured, replacing the commonName
 				if err := r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
@@ -2285,6 +2309,31 @@ func (r *Builder) generatePopulatorSuffix(migrationUID, vmID string, diskKey int
 	input := fmt.Sprintf("%s-%s-%d-%s-%d", migrationUID, vmID, diskKey, diskFile, diskIndex)
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])[:8]
+}
+
+// isStorageClassFADA checks if a StorageClass is Pure FlashArray Direct Access (FADA)
+// by examining its parameters for backend="pure_block" or backend="pure_file"
+func (r *Builder) isStorageClassFADA(storageClassName string) (bool, error) {
+	// Get the StorageClass object
+	storageClass := &storagev1.StorageClass{}
+	err := r.Destination.Client.Get(context.TODO(), client.ObjectKey{
+		Name: storageClassName,
+	}, storageClass)
+	if err != nil {
+		return false, fmt.Errorf("failed to get StorageClass %s: %w", storageClassName, err)
+	}
+
+	// Check if the backend parameter is pure_block or pure_file
+	if storageClass.Parameters != nil {
+		backend, exists := storageClass.Parameters["backend"]
+		if exists && (backend == "pure_block" || backend == "pure_file") {
+			r.Log.V(2).Info("StorageClass is FADA", "storageClass", storageClassName, "backend", backend)
+			return true, nil
+		}
+	}
+
+	r.Log.V(2).Info("StorageClass is not FADA", "storageClass", storageClassName)
+	return false, nil
 }
 
 func (r *Builder) ensureXCopyVolumePopulator(vp *api.VSphereXcopyVolumePopulator) error {
