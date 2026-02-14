@@ -25,6 +25,7 @@ import (
 	basecontroller "github.com/kubev2v/forklift/pkg/controller/base"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	"github.com/kubev2v/forklift/pkg/controller/plan/storage"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
 	container "github.com/kubev2v/forklift/pkg/controller/provider/container/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
@@ -1454,14 +1455,6 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				pvc.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.IsWarm())
 				pvc.Annotations["copy-offload"] = baseVolume(disk.File, r.Plan.IsWarm())
 
-				// Add target storage class annotation for non-FADA Pure FlashArray destinations
-				if targetStorageClass != "" {
-					pvc.Annotations["forklift.konveyor.io/target-storage-class"] = targetStorageClass
-					r.Log.Info("Added target storage class annotation for PXD handoff",
-						"pvc", pvc.Name,
-						"targetStorageClass", targetStorageClass)
-				}
-
 				// Apply PVC template naming if configured, replacing the commonName
 				if err := r.setColdMigrationDefaultPVCName(&pvc.ObjectMeta, vm, diskIndex, disk); err != nil {
 					r.Log.Info("Failed to set PVC name from template for populator volume, using default name", "error", err)
@@ -1546,6 +1539,33 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				}, createdPVC)
 				if err != nil {
 					return nil, err
+				}
+
+				// If we have a target storage class set, there is a need for additional storage vendor
+				// specific provisioning. The provisioned volume will be rebinded to the original PVC after the copy is complete.
+				if targetStorageClass != "" {
+					// Get storage-specific provisioner
+					provisioner, err := r.getVolumeProvisioner()
+					if err != nil {
+						return nil, liberr.Wrap(err, "failed to get volume provisioner")
+					}
+
+					if provisioner != nil && provisioner.NeedsAdditionalVolumes(createdPVC, targetStorageClass) {
+						r.Log.Info("Provisioning additional volumes for storage backend",
+							"pvc", createdPVC.Name,
+							"targetStorageClass", targetStorageClass)
+
+						// Ensure storage-specific ServiceAccount exists with required permissions
+						err = provisioner.EnsureServiceAccount(namespace)
+						if err != nil {
+							return nil, liberr.Wrap(err, "failed to ensure storage populator service account")
+						}
+
+						err = provisioner.ProvisionAdditionalVolumes(createdPVC, targetStorageClass, diskSecretName)
+						if err != nil {
+							return nil, liberr.Wrap(err, "failed to provision additional volumes")
+						}
+					}
 				}
 
 				vp.OwnerReferences[0].UID = createdPVC.UID
@@ -2327,13 +2347,19 @@ func (r *Builder) isStorageClassFADA(storageClassName string) (bool, error) {
 	if storageClass.Parameters != nil {
 		backend, exists := storageClass.Parameters["backend"]
 		if exists && (backend == "pure_block" || backend == "pure_file") {
-			r.Log.V(2).Info("StorageClass is FADA", "storageClass", storageClassName, "backend", backend)
+			r.Log.Info("StorageClass is FADA", "storageClass", storageClassName, "backend", backend)
 			return true, nil
 		}
 	}
 
-	r.Log.V(2).Info("StorageClass is not FADA", "storageClass", storageClassName)
+	r.Log.Info("StorageClass is not FADA", "storageClass", storageClassName)
 	return false, nil
+}
+
+// getVolumeProvisioner returns a storage-backend-specific volume provisioner
+// based on the plan context. Returns nil if no additional provisioning is needed.
+func (r *Builder) getVolumeProvisioner() (storage.VolumeProvisioner, error) {
+	return storage.NewProvisioner(r.Context)
 }
 
 func (r *Builder) ensureXCopyVolumePopulator(vp *api.VSphereXcopyVolumePopulator) error {

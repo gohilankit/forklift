@@ -107,6 +107,7 @@ HYPERV_PROVIDER_SERVER_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/forklift-hyperv-prov
 OVA_PROXY_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/forklift-ova-proxy:$(REGISTRY_TAG)
 CLI_DOWNLOAD_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/forklift-cli-download:$(REGISTRY_TAG)
 VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/vsphere-xcopy-volume-populator:$(REGISTRY_TAG)
+PORTWORX_POPULATOR_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/portworx-populator:$(REGISTRY_TAG)
 
 ### OLM
 OPERATOR_BUNDLE_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/forklift-operator-bundle:$(REGISTRY_TAG)
@@ -329,6 +330,8 @@ build-operator-bundle-image: check_container_runtime
 		--build-arg POPULATOR_CONTROLLER_IMAGE=$(POPULATOR_CONTROLLER_IMAGE)$(PLATFORM_SUFFIX) \
 		--build-arg OVIRT_POPULATOR_IMAGE=$(OVIRT_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) \
 		--build-arg OPENSTACK_POPULATOR_IMAGE=$(OPENSTACK_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) \
+		--build-arg VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE=$(VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) \
+		--build-arg PORTWORX_POPULATOR_IMAGE=$(PORTWORX_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) \
 		--build-arg MUST_GATHER_IMAGE=$(MUST_GATHER_IMAGE) \
 		--build-arg UI_PLUGIN_IMAGE=$(UI_PLUGIN_IMAGE) \
 		--build-arg CLI_DOWNLOAD_IMAGE=$(CLI_DOWNLOAD_IMAGE)$(PLATFORM_SUFFIX) \
@@ -397,6 +400,12 @@ build-vsphere-xcopy-volume-populator-image: check_container_runtime
 push-vsphere-xcopy-volume-populator-image: build-vsphere-xcopy-volume-populator-image
 	$(CONTAINER_CMD) push $(VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE)$(PLATFORM_SUFFIX)
 
+build-portworx-populator-image: check_container_runtime
+	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(PORTWORX_POPULATOR_IMAGE)$(PLATFORM_SUFFIX) -f cmd/portworx-populator/Dockerfile .
+
+push-portworx-populator-image: build-portworx-populator-image
+	$(CONTAINER_CMD) push $(PORTWORX_POPULATOR_IMAGE)$(PLATFORM_SUFFIX)
+
 build-ova-provider-server-image: check_container_runtime
 	$(CONTAINER_CMD) build $(PLATFORM_FLAG) -t $(OVA_PROVIDER_SERVER_IMAGE)$(PLATFORM_SUFFIX) -f build/ova-provider-server/Containerfile .
 
@@ -430,6 +439,7 @@ build-all-images: build-api-image \
                   build-ovirt-populator-image \
                   build-openstack-populator-image\
                   build-vsphere-xcopy-volume-populator-image\
+                  build-portworx-populator-image\
                   build-ova-provider-server-image \
                   build-hyperv-provider-server-image \
                   build-cli-download-image \

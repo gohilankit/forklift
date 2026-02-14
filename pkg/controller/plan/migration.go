@@ -21,7 +21,6 @@ import (
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
 	"github.com/kubev2v/forklift/pkg/controller/plan/migrator"
 	"github.com/kubev2v/forklift/pkg/controller/plan/scheduler"
-	"github.com/kubev2v/forklift/pkg/controller/plan/storage"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
 
 	libcnd "github.com/kubev2v/forklift/pkg/lib/condition"
@@ -74,8 +73,6 @@ type Migration struct {
 	converter *adapter.Converter
 	// vm migrator
 	migrator migrator.Migrator
-	// storage rebinder (optional, set based on storage backend detection)
-	storageRebinder storage.Rebinder
 }
 
 // Type of migration.
@@ -181,10 +178,6 @@ func (r *Migration) init() (err error) {
 		return
 	}
 	r.migrator, err = migrator.New(r.Context)
-	if err != nil {
-		return
-	}
-	r.storageRebinder, err = storage.NewRebinder(r.Context)
 	if err != nil {
 		return
 	}
@@ -966,6 +959,12 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				err = liberr.Wrap(err)
 				return
 			}
+			// Delete FADA PVCs that have been replaced by PXD PVCs (Pure/Portworx migrations)
+			err = r.kubevirt.DeleteFADAPVCs(vm)
+			if err != nil {
+				err = liberr.Wrap(err)
+				return
+			}
 			r.NextPhase(vm)
 		case api.PhaseAllocateDisks, api.PhaseCopyDisks:
 			step, found := vm.FindStep(r.migrator.Step(vm))
@@ -990,20 +989,6 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				break
 			}
 			if step.MarkedCompleted() && !step.HasError() {
-				// Perform storage-backend-specific volume rebinding if needed
-				// This is only required for certain storage backends (e.g., Pure/Portworx)
-				if r.storageRebinder != nil {
-					pvcs, err := r.kubevirt.getPVCs(vm.Ref)
-					if err == nil && r.storageRebinder.NeedsRebinding(vm.Ref, pvcs) {
-						err = r.storageRebinder.RebindVolumes(vm.Ref, string(r.Migration.UID))
-						if err != nil {
-							step.AddError(err.Error())
-							err = nil
-							break
-						}
-					}
-				}
-
 				if r.Plan.IsWarm() {
 					now := meta.Now()
 					next := meta.NewTime(now.Add(time.Duration(Settings.PrecopyInterval) * time.Minute))

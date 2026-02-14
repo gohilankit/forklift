@@ -132,6 +132,7 @@ populator_controller_deployment_name: "{{ app_name }}-volume-populator-controlle
 populator_controller_container_name: "{{ app_name }}-populator-controller"
 populator_openstack_image_fqin: "{{ lookup( 'env', 'OPENSTACK_POPULATOR_IMAGE') or lookup( 'env', 'RELATED_IMAGE_OPENSTACK_POPULATOR') }}"
 populator_vsphere_xcopy_volume_image_fqin: "{{ lookup( 'env', 'VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE') or lookup( 'env', 'RELATED_IMAGE_VSPHERE_XCOPY_VOLUME_POPULATOR') }}"
+populator_portworx_image_fqin: "{{ lookup( 'env', 'PORTWORX_POPULATOR_IMAGE') or lookup( 'env', 'RELATED_IMAGE_PORTWORX_POPULATOR') }}"
 
 must_gather_image_fqin: "{{ lookup( 'env', 'MUST_GATHER_IMAGE') or lookup( 'env', 'RELATED_IMAGE_MUST_GATHER') }}"
 

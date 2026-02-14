@@ -22,6 +22,7 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	"github.com/kubev2v/forklift/pkg/controller/plan/adapter"
+	"github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	inspectionparser "github.com/kubev2v/forklift/pkg/controller/plan/adapter/vsphere"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
@@ -857,6 +858,9 @@ func getDiskIndex(pvc *core.PersistentVolumeClaim) int {
 }
 
 // Return PersistentVolumeClaims associated with a VM.
+// If a PVC has a target PVC that is bound,
+// this method filters out the original PVC (since the target PVC will also be in the list).
+// It also copies necessary annotations from original to target PVC for mapDisks to work.
 func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, err error) {
 	pvcsList := &core.PersistentVolumeClaimList{}
 	// Add VM uuid
@@ -892,11 +896,56 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 		return
 	}
 
-	pvcs = make([]*core.PersistentVolumeClaim, len(pvcsList.Items))
-	for i, pvc := range pvcsList.Items {
-		// loopvar
-		pvc := pvc
-		pvcs[i] = &pvc
+	// Build a map of FADA PVCs that have bound PXD targets (to filter them out)
+	// and collect annotations to copy to PXD PVCs
+	fadaToSkip := make(map[string]bool)
+	fadaAnnotations := make(map[string]map[string]string) // targetPVCName -> annotations to copy
+
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+		if targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]; targetPVCName != "" {
+			// This is a FADA PVC with a target PXD PVC
+			// Check if target PXD PVC is bound
+			targetPVC := &core.PersistentVolumeClaim{}
+			targetErr := r.Destination.Client.Get(
+				context.TODO(),
+				client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+				targetPVC)
+			if targetErr == nil && targetPVC.Status.Phase == core.ClaimBound {
+				// Target PXD PVC is bound, mark FADA PVC to be skipped
+				fadaToSkip[pvc.Name] = true
+				// Store annotations to copy to PXD PVC
+				fadaAnnotations[targetPVCName] = map[string]string{}
+				if source, ok := pvc.Annotations[base.AnnDiskSource]; ok {
+					fadaAnnotations[targetPVCName][base.AnnDiskSource] = source
+				}
+				if backingFile, ok := pvc.Annotations[base.AnnImportBackingFile]; ok {
+					fadaAnnotations[targetPVCName][base.AnnImportBackingFile] = backingFile
+				}
+			}
+		}
+	}
+
+	pvcs = make([]*core.PersistentVolumeClaim, 0, len(pvcsList.Items))
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+
+		// Skip FADA PVCs that have bound PXD targets
+		if fadaToSkip[pvc.Name] {
+			continue
+		}
+
+		// If this is a PXD PVC, copy annotations from its FADA source
+		if annotations, ok := fadaAnnotations[pvc.Name]; ok {
+			if pvc.Annotations == nil {
+				pvc.Annotations = make(map[string]string)
+			}
+			for k, v := range annotations {
+				pvc.Annotations[k] = v
+			}
+		}
+
+		pvcs = append(pvcs, pvc)
 	}
 
 	// Sort the pvcs slice by disk index
@@ -907,6 +956,71 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 	})
 
 	return
+}
+
+// DeleteFADAPVCs deletes FADA PVCs that have been replaced by bound PXD PVCs.
+// This should be called after the VM is created with PXD PVCs.
+func (r *KubeVirt) DeleteFADAPVCs(vm *plan.VMStatus) error {
+	// Query all PVCs directly (not using getPVCs which filters out FADA PVCs)
+	pvcsList := &core.PersistentVolumeClaimList{}
+	labelSelector := map[string]string{
+		kVM: vm.Ref.ID,
+	}
+	if r.Plan.Spec.Type != api.MigrationOnlyConversion {
+		labelSelector[kMigration] = string(r.Migration.UID)
+	}
+	err := r.Destination.Client.List(
+		context.TODO(),
+		pvcsList,
+		&client.ListOptions{
+			LabelSelector: k8slabels.SelectorFromSet(labelSelector),
+			Namespace:     r.Plan.Spec.TargetNamespace,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	for i := range pvcsList.Items {
+		pvc := &pvcsList.Items[i]
+		targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]
+		if targetPVCName == "" {
+			continue
+		}
+
+		// Check if target PXD PVC is bound
+		targetPVC := &core.PersistentVolumeClaim{}
+		err := r.Destination.Client.Get(
+			context.TODO(),
+			client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+			targetPVC)
+		if err != nil {
+			r.Log.Error(err, "Failed to get target PXD PVC", "pvc", targetPVCName)
+			continue
+		}
+
+		if targetPVC.Status.Phase != core.ClaimBound {
+			r.Log.Info("Target PXD PVC not bound yet, skipping FADA PVC deletion",
+				"fadaPVC", pvc.Name,
+				"pxdPVC", targetPVCName,
+				"phase", targetPVC.Status.Phase)
+			continue
+		}
+
+		// Delete the FADA PVC
+		r.Log.Info("Deleting FADA PVC replaced by PXD PVC",
+			"fadaPVC", pvc.Name,
+			"pxdPVC", targetPVCName)
+		err = r.Destination.Client.Delete(context.TODO(), pvc)
+		if err != nil {
+			if !k8serr.IsNotFound(err) {
+				r.Log.Error(err, "Failed to delete FADA PVC", "pvc", pvc.Name)
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // Creates the PVs and PVCs for LUN disks.

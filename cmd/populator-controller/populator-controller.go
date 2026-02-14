@@ -19,7 +19,6 @@ import (
 const (
 	prefix     = "forklift.konveyor.io"
 	mountPath  = "/mnt/"
-	devicePath = "/dev/block"
 	groupName  = "forklift.konveyor.io"
 	apiVersion = "v1beta1"
 )
@@ -30,6 +29,7 @@ type populator struct {
 	controllerFunc  func(bool, *unstructured.Unstructured, corev1.PersistentVolumeClaim) ([]string, error)
 	imageVar        string
 	metricsEndpoint string
+	devicePath      string // Path where PVC block device should be mounted (empty if not needed)
 }
 
 var populators = map[string]populator{
@@ -39,6 +39,7 @@ var populators = map[string]populator{
 		controllerFunc:  getOvirtPopulatorPodArgs,
 		imageVar:        "OVIRT_POPULATOR_IMAGE",
 		metricsEndpoint: ":8080",
+		devicePath:      "/dev/block", // Ovirt populator needs PVC mounted as block device
 	},
 	"openstack": {
 		kind:            "OpenstackVolumePopulator",
@@ -46,6 +47,7 @@ var populators = map[string]populator{
 		controllerFunc:  getOpenstackPopulatorPodArgs,
 		imageVar:        "OPENSTACK_POPULATOR_IMAGE",
 		metricsEndpoint: ":8081",
+		devicePath:      "/dev/block", // Openstack populator needs PVC mounted as block device
 	},
 	"vsphere-xcopy": {
 		kind:            "VSphereXcopyVolumePopulator",
@@ -53,6 +55,15 @@ var populators = map[string]populator{
 		controllerFunc:  getVXPopulatorPodArgs,
 		imageVar:        "VSPHERE_XCOPY_VOLUME_POPULATOR_IMAGE",
 		metricsEndpoint: ":8082",
+		devicePath:      "/dev/block", // VSphere populator needs PVC mounted as block device
+	},
+	"portworx": {
+		kind:            "PortworxVolumePopulator",
+		resource:        "portworxvolumepopulators",
+		controllerFunc:  getPortworxPopulatorPodArgs,
+		imageVar:        "PORTWORX_POPULATOR_IMAGE",
+		metricsEndpoint: ":8083",
+		devicePath:      "", // Portworx populator doesn't need PVC mounted (uses PV name directly)
 	},
 }
 
@@ -94,6 +105,7 @@ func main() {
 		gvr := schema.GroupVersionResource{Group: groupName, Version: apiVersion, Resource: populator.resource}
 		controllerFunc := populator.controllerFunc
 		metricsEndpoint := populator.metricsEndpoint
+		devicePath := populator.devicePath
 		go func() {
 			populator_machinery.RunController(masterURL, kubeconfig, imageName, metricsEndpoint, metricsPath,
 				prefix, gk, gvr, mountPath, devicePath, controllerFunc, resources)
@@ -111,7 +123,7 @@ func getOvirtPopulatorPodArgs(rawBlock bool, u *unstructured.Unstructured, _ cor
 	}
 
 	var args []string
-	args = append(args, "--volume-path="+getVolumePath(rawBlock))
+	args = append(args, "--volume-path="+getVolumePath(rawBlock, "/dev/block"))
 	args = append(args, "--secret-name="+ovirtVolumePopulator.Spec.EngineSecretName)
 	args = append(args, "--disk-id="+ovirtVolumePopulator.Spec.DiskID)
 	args = append(args, "--engine-url="+ovirtVolumePopulator.Spec.EngineURL)
@@ -128,7 +140,7 @@ func getOpenstackPopulatorPodArgs(rawBlock bool, u *unstructured.Unstructured, _
 		return nil, err
 	}
 	args := []string{}
-	args = append(args, "--volume-path="+getVolumePath(rawBlock))
+	args = append(args, "--volume-path="+getVolumePath(rawBlock, "/dev/block"))
 	args = append(args, "--endpoint="+openstackPopulator.Spec.IdentityURL)
 	args = append(args, "--secret-name="+openstackPopulator.Spec.SecretName)
 	args = append(args, "--image-id="+openstackPopulator.Spec.ImageID)
@@ -157,7 +169,29 @@ func getVXPopulatorPodArgs(_ bool, u *unstructured.Unstructured, pvc corev1.Pers
 	return args, nil
 }
 
-func getVolumePath(rawBlock bool) string {
+func getPortworxPopulatorPodArgs(_ bool, u *unstructured.Unstructured, pvc corev1.PersistentVolumeClaim) ([]string, error) {
+	var portworx v1beta1.PortworxVolumePopulator
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), &portworx)
+	if nil != err {
+		return nil, err
+	}
+	// The destination PVC is the "prime" PVC created by the populator controller,
+	// not the original PVC. The prime PVC name is "prime-<pvc.UID>".
+	// The original PVC won't be bound until the populator completes.
+	destPvcName := "prime-" + string(pvc.UID)
+	args := []string{
+		"--source-pvc=" + portworx.Spec.SourcePvc,
+		"--source-namespace=" + portworx.Spec.SourceNamespace,
+		"--dest-pvc=" + destPvcName,
+		"--dest-namespace=" + pvc.Namespace,
+		"--secret-name=" + portworx.Spec.SecretName,
+		"--cr-name=" + portworx.Name,
+		"--cr-namespace=" + portworx.Namespace,
+	}
+	return args, nil
+}
+
+func getVolumePath(rawBlock bool, devicePath string) string {
 	if rawBlock {
 		return devicePath
 	} else {

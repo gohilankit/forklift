@@ -105,6 +105,11 @@ var (
 			resource:           api.VSphereXcopyVolumePopulatorResource,
 			regexKey:           "vsphere_xcopy_volume_populator",
 		},
+		api.PortworxVolumePopulatorKind: {
+			storageResourceKey: "source_pvc",
+			resource:           api.PortworxVolumePopulatorResource,
+			regexKey:           "portworx_volume_populator",
+		},
 	}
 
 	monitoredPVCs = map[string]interface{}{}
@@ -640,6 +645,81 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 			if c.gk.Kind == api.VSphereXcopyVolumePopulatorKind {
 				pod.Spec.ServiceAccountName = "populator"
 			}
+			if c.gk.Kind == api.PortworxVolumePopulatorKind {
+				pod.Spec.ServiceAccountName = "portworx-populator"
+				// Enable hostPID to allow nsenter to access host processes
+				pod.Spec.HostPID = true
+				// Override pod-level security context for privileged access
+				// Remove SeccompProfile and FSGroup that are incompatible with privileged SCC
+				pod.Spec.SecurityContext = &corev1.PodSecurityContext{}
+				// Override container-level security context for privileged access
+				// Clear all restrictive settings from makePopulatePodSpec
+				pod.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
+					Privileged:               ptr.To(true),
+					AllowPrivilegeEscalation: ptr.To(true),
+					RunAsUser:                ptr.To[int64](0), // Run as root for nsenter/mdadm
+					RunAsNonRoot:             ptr.To(false),    // Allow running as root
+				}
+				// Mount host filesystem at /host for chroot execution
+				// Mount host /dev at /dev to access PXD and mapper devices:
+				pod.Spec.Volumes = append(pod.Spec.Volumes,
+					corev1.Volume{
+						Name: "host-root",
+						VolumeSource: corev1.VolumeSource{
+							HostPath: &corev1.HostPathVolumeSource{
+								Path: "/",
+							},
+						},
+					},
+					corev1.Volume{
+						Name: "host-dev",
+						VolumeSource: corev1.VolumeSource{
+							HostPath: &corev1.HostPathVolumeSource{
+								Path: "/dev",
+							},
+						},
+					},
+				)
+				pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+					corev1.VolumeMount{
+						Name:      "host-root",
+						MountPath: "/host",
+					},
+					corev1.VolumeMount{
+						Name:      "host-dev",
+						MountPath: "/dev",
+					},
+				)
+
+				// Mount source FADA PVC to trigger CSI attachment to the host
+				// The PortworxVolumePopulator CR spec contains the source PVC name
+				sourcePvcName, found, err := unstructured.NestedString(crInstance.Object, "spec", "sourcePvc")
+				if err != nil {
+					klog.Errorf("Failed to get sourcePvc from PortworxVolumePopulator CR: %v", err)
+				} else if found && sourcePvcName != "" {
+					// Add source PVC as a volume
+					pod.Spec.Volumes = append(pod.Spec.Volumes,
+						corev1.Volume{
+							Name: "source-volume",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: sourcePvcName,
+								},
+							},
+						},
+					)
+					// Mount source PCS as block device to trigger CSI attachment
+					// Mount at /dev/fa-source so it's visible to nsenter commands on the host
+					if rawBlock {
+						pod.Spec.Containers[0].VolumeDevices = append(pod.Spec.Containers[0].VolumeDevices,
+							corev1.VolumeDevice{
+								Name:       "source-volume",
+								DevicePath: "/dev/fa-source",
+							},
+						)
+					}
+				}
+			}
 			pod.Spec.Volumes[0].VolumeSource.PersistentVolumeClaim.ClaimName = pvcPrimeName
 			con := &pod.Spec.Containers[0]
 			con.Image = c.imageName
@@ -647,14 +727,23 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 			if c.resources != nil {
 				con.Resources = *c.resources
 			}
-			if rawBlock {
-				con.VolumeDevices = []corev1.VolumeDevice{
-					{
-						Name:       populatorPodVolumeName,
-						DevicePath: c.devicePath,
-					},
+			// Mount the destination PVC' (pvcPrime) to trigger CSI attachment
+			// For most populators, this is where they write the populated data
+			// For Portworx populator, we mount it to trigger CSI attachment even though
+			// the actual data access happens via /dev/pxd/<pv-name> paths
+			if rawBlock && (c.devicePath != "" || c.gk.Kind == api.PortworxVolumePopulatorKind) {
+				devicePath := c.devicePath
+				if devicePath == "" {
+					// Portworx populator: use a dummy device path
+					// The actual device access happens via /dev/pxd/<pv-name>
+					devicePath = "/dev/pxd-dest"
 				}
-			} else {
+				// Append to existing volumeDevices (don't overwrite - source volume may already be added)
+				con.VolumeDevices = append(con.VolumeDevices, corev1.VolumeDevice{
+					Name:       populatorPodVolumeName,
+					DevicePath: devicePath,
+				})
+			} else if !rawBlock && c.mountPath != "" {
 				con.VolumeMounts = []corev1.VolumeMount{
 					{
 						Name:      populatorPodVolumeName,
@@ -662,6 +751,8 @@ func (c *controller) syncPvc(ctx context.Context, key, pvcNamespace, pvcName str
 					},
 				}
 			}
+
+			pod.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
 
 			if waitForFirstConsumer {
 				pod.Spec.NodeName = nodeName
