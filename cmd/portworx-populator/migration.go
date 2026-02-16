@@ -5,9 +5,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,21 +19,33 @@ import (
 	"time"
 )
 
-// -----------------------------
-// Constants & globals
-// -----------------------------
+// Config holds the configuration for the migration.
+type Config struct {
+	// FlashArray settings
+	FAIP       string
+	FAAPIVer   string
+	FAAPIToken string
 
+	// Worker settings
+	Jobs          int // XCOPY goroutines for step 4
+	Step2Workers  int // PXD poke workers for step 2
+	StatsInterval int // Stats interval in seconds (0 = disable)
+}
+
+// DefaultConfig returns a Config with default values.
+func DefaultConfig() Config {
+	return Config{
+		FAAPIVer:      DefaultFAVersion,
+		Jobs:          DefaultStep4Workers,
+		Step2Workers:  DefaultStep2Workers,
+		StatsInterval: DefaultStatsInterval,
+	}
+}
+
+// Constants
 const (
-	// DefaultSegmentLength   = 137438953472 // 128 GiB segments
-	// DefaultFAToken        = "08ecb99c-96df-123d-5ace-5930156a6f17"
-	// DefaultFAIP            = "mh531-f17.dev.purestorage.com"
-
 	DefaultSegmentLength = 107374182400 // 100 GiB segments
-	DefaultFAToken       = "53321f38-6416-7356-cba1-6fe60bb02c9b"
-	DefaultFAIP          = "js500-9.dev.purestorage.com"
-
-	DefaultFAVersion = "2.41"
-	// DefaultBlockSize       = 1048576     // 1 MiB block_size for FA diff
+	DefaultFAVersion     = "2.41"
 	DefaultBlockSize     = 4096 // 4K block_size for FA diff
 	DefaultSegmentOffset = 0
 	DefaultThinBlockSize = 64 * 1024 // 64 KiB
@@ -43,22 +54,6 @@ const (
 	DefaultStep4Workers  = 512
 	DefaultStatsInterval = 30
 	MaxXcopyWorkersCap   = 4096
-	MaxStep              = 4
-	MinStep              = 1
-)
-
-// global flags
-var (
-	flagDryRun        bool
-	flagStep          int
-	flagMaxStep       int
-	flagJobs          int
-	flagStep2Workers  int
-	flagStatsInterval int
-
-	flagFaIP       string
-	flagFaAPIVer   string
-	flagFaAPIToken string
 )
 
 // /dev/null reuse for sg_xcopy
@@ -78,14 +73,84 @@ func getDevNull() *os.File {
 	return devNull
 }
 
-// -----------------------------
-// Logging helpers
-// -----------------------------
+// LogFunc is a function type for logging.
+type LogFunc func(format string, args ...interface{})
 
-func logWithTime(format string, args ...interface{}) {
+// defaultLogger logs with timestamp to stdout.
+func defaultLogger(format string, args ...interface{}) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf(format, args...)
 	fmt.Printf("%s | %s\n", ts, msg)
+}
+
+// RunMigration executes the full 4-step migration pipeline.
+// It migrates data from source PX volume (FADA) to destination PX volume (PXD) using below 4 steps:
+//  1. Fetch FlashArray diff extents
+//  2. Prepare PXD thin mappings (poke extents)
+//  3. Build FA->backend mapping
+//  4. Copy data via XCOPY
+func RunMigration(srcPxVol, dstPxVol string, cfg Config) error {
+	return RunMigrationWithLogger(srcPxVol, dstPxVol, cfg, defaultLogger)
+}
+
+// RunMigrationWithLogger executes the migration with a custom logger.
+func RunMigrationWithLogger(srcPxVol, dstPxVol string, cfg Config, log LogFunc) error {
+	startAll := time.Now()
+	log("Starting FADA->PX backend migration pipeline")
+	log("Source FADA PX volume: %s", srcPxVol)
+	log("Destination PXD PX volume: %s", dstPxVol)
+
+	shortToken := cfg.FAAPIToken
+	if len(shortToken) > 6 {
+		shortToken = shortToken[:6] + "..."
+	}
+	log("Using FlashArray: ip=%s, api_ver=%s (token: %s)", cfg.FAIP, cfg.FAAPIVer, shortToken)
+
+	// Create migrator instance
+	m := &migrator{
+		cfg: cfg,
+		log: log,
+	}
+
+	// STEP 1: Fetch FA diff extents
+	if err := m.runStep1FetchExtents(srcPxVol); err != nil {
+		log("ERROR: Step 1 failed: %v", err)
+		return fmt.Errorf("step 1 failed: %w", err)
+	}
+
+	// STEP 2: Prepare PXD thin mappings
+	if err := m.runStep2PreparePxdMappings(srcPxVol, dstPxVol); err != nil {
+		log("ERROR: Step 2 failed: %v", err)
+		return fmt.Errorf("step 2 failed: %w", err)
+	}
+
+	// Wait for thin pool metadata to be committed before Step 3
+	log("Waiting 2 seconds for thin pool metadata to be committed...")
+	time.Sleep(2 * time.Second)
+
+	// STEP 3: Build FA->backend mapping
+	mappingFile, aggFile, err := m.runStep3BuildMapping(srcPxVol, dstPxVol)
+	if err != nil {
+		log("ERROR: Step 3 failed: %v", err)
+		return fmt.Errorf("step 3 failed: %w", err)
+	}
+	log("Step 3: mapping files: detailed=%s, aggregated=%s", mappingFile, aggFile)
+
+	// STEP 4: Copy data via XCOPY
+	if err := m.runStep4CopyData(srcPxVol, dstPxVol); err != nil {
+		log("ERROR: Step 4 failed: %v", err)
+		return fmt.Errorf("step 4 failed: %w", err)
+	}
+
+	elapsedAll := time.Since(startAll).Seconds()
+	log("All steps completed. Total elapsed: %.1f seconds", elapsedAll)
+	return nil
+}
+
+// migrator holds the state for a migration run.
+type migrator struct {
+	cfg Config
+	log LogFunc
 }
 
 // -----------------------------
@@ -94,7 +159,6 @@ func logWithTime(format string, args ...interface{}) {
 
 // isInContainer checks if we're running in a container with host access
 func isInContainer() bool {
-	// Compare our mount namespace with PID 1's mount namespace
 	selfNs, err := os.Readlink("/proc/self/ns/mnt")
 	if err != nil {
 		return false
@@ -103,41 +167,30 @@ func isInContainer() bool {
 	if err != nil {
 		return false
 	}
-	// If our mount namespace differs from PID 1's, we're in a container
 	return selfNs != pid1Ns
 }
 
 // needsNsenterForDevices checks if we need nsenter for device operations
-// Returns false if host's /dev is already mounted (via hostPath)
 func needsNsenterForDevices() bool {
-	// If not in container, no nsenter needed
 	if !isInContainer() {
 		return false
 	}
-
-	// Check if /dev is mounted from host by looking for PXD devices
-	// If we can see /dev/pxd/, it means host's /dev is mounted
 	if _, err := os.Stat("/dev/pxd"); err == nil {
-		// Host /dev is mounted, no nsenter needed for device operations
 		return false
 	}
-
-	// In container without host /dev mounted, need nsenter
 	return true
 }
 
-// wrapWithChrootHost wraps command with chroot /host for container with host filesystem mounted
+// wrapWithChrootHost wraps command with chroot /host
 func wrapWithChrootHost(args []string) []string {
 	return append([]string{"chroot", "/host"}, args...)
 }
 
 // wrapWithNsenter prepends nsenter command if running in container
-// Used for commands that need host network access (e.g., pxctl -> localhost:17001)
 func wrapWithNsenter(args []string) []string {
 	if !isInContainer() {
 		return args
 	}
-	// Prepend nsenter to run command on host
 	nsenterArgs := []string{
 		"nsenter",
 		"--target", "1",
@@ -151,15 +204,11 @@ func wrapWithNsenter(args []string) []string {
 	return append(nsenterArgs, args...)
 }
 
-// -----------------------------
-// Shell helper
-// -----------------------------
-
+// runCmd executes a command, wrapping with nsenter if in container
 func runCmd(args ...string) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("runCmd: empty command")
 	}
-	// Wrap with nsenter if in container (needed for pxctl network access to localhost:17001)
 	wrappedArgs := wrapWithNsenter(args)
 	cmd := exec.Command(wrappedArgs[0], wrappedArgs[1:]...)
 	out, err := cmd.CombinedOutput()
@@ -203,6 +252,7 @@ func parseSize(s string) (uint64, error) {
 	return v * mult, nil
 }
 
+// Extent represents a data extent with offset and length.
 type Extent struct {
 	Offset uint64
 	Length uint64
@@ -250,6 +300,7 @@ func loadExtents(path string) ([]Extent, error) {
 // PX helpers
 // -----------------------------
 
+// PxVolInfo holds information about a Portworx volume.
 type PxVolInfo struct {
 	Name    string
 	VolID   string
@@ -337,7 +388,7 @@ func faLogin(ip, apiVer, apiToken string) (string, error) {
 	url := fmt.Sprintf("https://%s/api/%s/login", ip, apiVer)
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // equivalent to curl -k
+			InsecureSkipVerify: true,
 		},
 	}
 	client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
@@ -384,10 +435,10 @@ func faFetchDiffExtents(ip, apiVer, xAuthToken, faVolName string, segLen, blockS
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("FA diff extents failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -401,35 +452,34 @@ func faFetchDiffExtents(ip, apiVer, xAuthToken, faVolName string, segLen, blockS
 	return diff.Items, nil
 }
 
-func runStep1FetchExtents(srcPxVol string) error {
-	logWithTime("===== STEP 1/4: Fetch FlashArray diff extents =====")
-	logWithTime("Step 1: determining FlashArray volume name for source PX volume %q", srcPxVol)
+func (m *migrator) runStep1FetchExtents(srcPxVol string) error {
+	m.log("===== STEP 1/4: Fetch FlashArray diff extents =====")
+	m.log("Step 1: determining FlashArray volume name for source PX volume %q", srcPxVol)
 
 	clusterID, err := getPxClusterIDPrefix()
 	if err != nil {
 		return fmt.Errorf("step1: failed to get PX cluster ID: %w", err)
 	}
 	faVolName := fmt.Sprintf("px_%s-%s", clusterID, srcPxVol)
-	logWithTime("Step 1: using FlashArray volume name %q", faVolName)
+	m.log("Step 1: using FlashArray volume name %q", faVolName)
 
-	logWithTime("Step 1: logging in to FlashArray %s (API %s)", flagFaIP, flagFaAPIVer)
-	xAuth, err := faLogin(flagFaIP, flagFaAPIVer, flagFaAPIToken)
+	m.log("Step 1: logging in to FlashArray %s (API %s)", m.cfg.FAIP, m.cfg.FAAPIVer)
+	xAuth, err := faLogin(m.cfg.FAIP, m.cfg.FAAPIVer, m.cfg.FAAPIToken)
 	if err != nil {
 		return fmt.Errorf("step1: FA login failed: %w", err)
 	}
-	logWithTime("Step 1: FlashArray login succeeded")
+	m.log("Step 1: FlashArray login succeeded")
 
-	logWithTime("Step 1: fetching diff extents (segment_length=%d, block_size=%d, segment_offset=%d)",
+	m.log("Step 1: fetching diff extents (segment_length=%d, block_size=%d, segment_offset=%d)",
 		DefaultSegmentLength, DefaultBlockSize, DefaultSegmentOffset)
 
-	items, err := faFetchDiffExtents(flagFaIP, flagFaAPIVer, xAuth, faVolName, DefaultSegmentLength, DefaultBlockSize, DefaultSegmentOffset)
+	items, err := faFetchDiffExtents(m.cfg.FAIP, m.cfg.FAAPIVer, xAuth, faVolName, DefaultSegmentLength, DefaultBlockSize, DefaultSegmentOffset)
 	if err != nil {
 		return fmt.Errorf("step1: fetch diff extents failed: %w", err)
 	}
 
 	var totalBytes uint64
 	var minLen, maxLen uint64
-	minLen = 0
 	for _, it := range items {
 		totalBytes += it.Length
 		if minLen == 0 || it.Length < minLen {
@@ -440,7 +490,7 @@ func runStep1FetchExtents(srcPxVol string) error {
 		}
 	}
 	giB := float64(totalBytes) / (1024.0 * 1024.0 * 1024.0)
-	logWithTime("Step 1: received %d extents from FlashArray (total bytes=%d, ~%.2f GiB)", len(items), totalBytes, giB)
+	m.log("Step 1: received %d extents from FlashArray (total bytes=%d, ~%.2f GiB)", len(items), totalBytes, giB)
 
 	extFile := fmt.Sprintf("%s.extents", srcPxVol)
 	f, err := os.Create(extFile)
@@ -453,8 +503,8 @@ func runStep1FetchExtents(srcPxVol string) error {
 	for _, it := range items {
 		fmt.Fprintf(f, "%d %d\n", it.Offset, it.Length)
 	}
-	logWithTime("Step 1: extents written to %s", extFile)
-	logWithTime("Step 1: summary: extents=%d, segment_length=%d, block_size=%d", len(items), DefaultSegmentLength, DefaultBlockSize)
+	m.log("Step 1: extents written to %s", extFile)
+	m.log("Step 1: summary: extents=%d, segment_length=%d, block_size=%d", len(items), DefaultSegmentLength, DefaultBlockSize)
 	return nil
 }
 
@@ -462,12 +512,9 @@ func runStep1FetchExtents(srcPxVol string) error {
 // Step 2: Poke PXD thin mapping
 // -----------------------------
 
-func pokeExtentRangeWithBuf(f *os.File, offset, length, thinBlockSize uint64, buf []byte, dryRun bool) (uint64, error) {
+func pokeExtentRangeWithBuf(f *os.File, offset, length, thinBlockSize uint64, buf []byte) (uint64, error) {
 	if length == 0 {
 		return 0, nil
-	}
-	if offset%512 != 0 {
-		logWithTime("Step 2: WARNING: extent offset %d is not 512B-aligned", offset)
 	}
 	origOffset := offset
 	start := origOffset & ^(thinBlockSize - 1)
@@ -475,22 +522,17 @@ func pokeExtentRangeWithBuf(f *os.File, offset, length, thinBlockSize uint64, bu
 
 	var blocks uint64
 	for pos := start; pos <= end; pos += thinBlockSize {
-		if pos%512 != 0 {
-			logWithTime("Step 2: WARNING: block_offset %d not 512B-aligned", pos)
-		}
-		if !dryRun {
-			if _, err := f.WriteAt(buf, int64(pos)); err != nil {
-				return blocks, fmt.Errorf("write at offset %d failed: %w", pos, err)
-			}
+		if _, err := f.WriteAt(buf, int64(pos)); err != nil {
+			return blocks, fmt.Errorf("write at offset %d failed: %w", pos, err)
 		}
 		blocks++
 	}
 	return blocks, nil
 }
 
-func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
-	logWithTime("===== STEP 2/4: Prepare PXD thin mappings (poke extents) =====")
-	logWithTime("Step 2: preparing thin mappings on destination PX volume %q", dstPxVol)
+func (m *migrator) runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
+	m.log("===== STEP 2/4: Prepare PXD thin mappings (poke extents) =====")
+	m.log("Step 2: preparing thin mappings on destination PX volume %q", dstPxVol)
 
 	dstInfo, err := getPxVolInfoWithDevice(dstPxVol)
 	if err != nil {
@@ -506,28 +548,21 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 		return fmt.Errorf("step2: load extents from %s: %w", extFile, err)
 	}
 	if len(extents) == 0 {
-		logWithTime("Step 2: no extents found in %s, nothing to poke", extFile)
+		m.log("Step 2: no extents found in %s, nothing to poke", extFile)
 		return nil
 	}
 
-	var totalBytes, minLen, maxLen uint64
-	minLen = 0
+	var totalBytes uint64
 	for _, e := range extents {
 		totalBytes += e.Length
-		if minLen == 0 || e.Length < minLen {
-			minLen = e.Length
-		}
-		if e.Length > maxLen {
-			maxLen = e.Length
-		}
 	}
 	giB := float64(totalBytes) / (1024.0 * 1024.0 * 1024.0)
 	approxBlocks := totalBytes / DefaultThinBlockSize
 
-	logWithTime("Step 2: device=%s, extents=%d, total_bytes=%d (~%.2f GiB), min_len=%d, max_len=%d, approx_thin_blocks=%d",
-		dstInfo.DevPath, len(extents), totalBytes, giB, minLen, maxLen, approxBlocks)
+	m.log("Step 2: device=%s, extents=%d, total_bytes=%d (~%.2f GiB), approx_thin_blocks=%d",
+		dstInfo.DevPath, len(extents), totalBytes, giB, approxBlocks)
 
-	workers := flagStep2Workers
+	workers := m.cfg.Step2Workers
 	if workers <= 0 {
 		workers = DefaultStep2Workers
 	}
@@ -539,10 +574,9 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 	}
 
 	thinKB := DefaultThinBlockSize / 1024
-	logWithTime("Step 2: thin_block_size=%d KiB, poke_size=%d bytes, workers=%d, dry_run=%v",
-		thinKB, DefaultPokeSize, workers, flagDryRun)
+	m.log("Step 2: thin_block_size=%d KiB, poke_size=%d bytes, workers=%d",
+		thinKB, DefaultPokeSize, workers)
 
-	// concurrency
 	tasks := make(chan Extent, len(extents))
 	for _, e := range extents {
 		tasks <- e
@@ -556,8 +590,8 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 	start := time.Now()
 
 	// stats goroutine
-	if flagStatsInterval > 0 {
-		ticker := time.NewTicker(time.Duration(flagStatsInterval) * time.Second)
+	if m.cfg.StatsInterval > 0 {
+		ticker := time.NewTicker(time.Duration(m.cfg.StatsInterval) * time.Second)
 		go func() {
 			defer ticker.Stop()
 			var prevBlocks uint64
@@ -571,7 +605,7 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 				deltaBlk := bp - prevBlocks
 				prevBlocks = bp
 
-				logWithTime("Step 2: progress: %d/%d extents, blocks_poked=%d (+%d), elapsed=%.1fs",
+				m.log("Step 2: progress: %d/%d extents, blocks_poked=%d (+%d), elapsed=%.1fs",
 					ed, len(extents), bp, deltaBlk, elapsed)
 			}
 		}()
@@ -583,24 +617,21 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 			defer wg.Done()
 			fd, err := os.OpenFile(dstInfo.DevPath, os.O_RDWR, 0)
 			if err != nil {
-				logWithTime("Step 2: ERROR: open %s failed: %v", dstInfo.DevPath, err)
+				m.log("Step 2: ERROR: open %s failed: %v", dstInfo.DevPath, err)
 				return
 			}
 			defer func() {
-				// Sync before closing to ensure writes are flushed
-				if !flagDryRun {
-					if err := fd.Sync(); err != nil {
-						logWithTime("Step 2: WARNING: sync failed: %v", err)
-					}
+				if err := fd.Sync(); err != nil {
+					m.log("Step 2: WARNING: sync failed: %v", err)
 				}
 				fd.Close()
 			}()
 
 			buf := make([]byte, DefaultPokeSize)
 			for e := range tasks {
-				n, err := pokeExtentRangeWithBuf(fd, e.Offset, e.Length, DefaultThinBlockSize, buf, flagDryRun)
+				n, err := pokeExtentRangeWithBuf(fd, e.Offset, e.Length, DefaultThinBlockSize, buf)
 				if err != nil {
-					logWithTime("Step 2: ERROR: poke extent off=%d len=%d: %v", e.Offset, e.Length, err)
+					m.log("Step 2: ERROR: poke extent off=%d len=%d: %v", e.Offset, e.Length, err)
 					continue
 				}
 				atomic.AddUint64(&blocksPoked, n)
@@ -614,22 +645,20 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 	finalBlocks := atomic.LoadUint64(&blocksPoked)
 	bytesPoked := finalBlocks * DefaultPokeSize
 	giPoked := float64(bytesPoked) / (1024.0 * 1024.0 * 1024.0)
-	logWithTime("Step 2: completed poking PXD thin mappings. Extents=%d, blocks_poked=%d, bytes_poked=%d (%.2f GiB), elapsed=%.1fs",
+	m.log("Step 2: completed poking PXD thin mappings. Extents=%d, blocks_poked=%d, bytes_poked=%d (%.2f GiB), elapsed=%.1fs",
 		len(extents), finalBlocks, bytesPoked, giPoked, elapsed)
 
-	// Sync the device one more time to ensure all writes are flushed
-	if !flagDryRun {
-		logWithTime("Step 2: syncing device %s to ensure metadata is committed", dstInfo.DevPath)
-		fd, err := os.OpenFile(dstInfo.DevPath, os.O_RDWR, 0)
-		if err != nil {
-			logWithTime("Step 2: WARNING: failed to open device for final sync: %v", err)
-		} else {
-			if err := fd.Sync(); err != nil {
-				logWithTime("Step 2: WARNING: final sync failed: %v", err)
-			}
-			fd.Close()
-			logWithTime("Step 2: device sync completed")
+	// Final sync
+	m.log("Step 2: syncing device %s to ensure metadata is committed", dstInfo.DevPath)
+	fd, err := os.OpenFile(dstInfo.DevPath, os.O_RDWR, 0)
+	if err != nil {
+		m.log("Step 2: WARNING: failed to open device for final sync: %v", err)
+	} else {
+		if err := fd.Sync(); err != nil {
+			m.log("Step 2: WARNING: final sync failed: %v", err)
 		}
+		fd.Close()
+		m.log("Step 2: device sync completed")
 	}
 
 	return nil
@@ -639,12 +668,14 @@ func runStep2PreparePxdMappings(srcPxVol, dstPxVol string) error {
 // Step 3: FA->backend mapping
 // -----------------------------
 
+// Mapping represents a thin pool mapping entry.
 type Mapping struct {
 	OriginBegin uint64
 	DataBegin   uint64
 	Length      uint64
 }
 
+// Member represents a RAID array member device.
 type Member struct {
 	Name            string
 	DataOffsetBytes uint64
@@ -654,8 +685,6 @@ type thinSuperblockXML struct {
 	XMLName       xml.Name        `xml:"superblock"`
 	DataBlockSize string          `xml:"data_block_size,attr"`
 	Devices       []thinDeviceXML `xml:"device"`
-	OtherElements []xml.Name      `xml:",any"`
-	OtherAttrs    []xml.Attr      `xml:",any,attr"`
 }
 
 type thinDeviceXML struct {
@@ -675,7 +704,7 @@ type rangeMappingXML struct {
 }
 
 func parseThinDumpFile(path string) (int, uint64, []Mapping, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -832,7 +861,6 @@ func genThinDumpXML(poolPrefix string, thinID int, volName, volID string) (strin
 	}
 	defer f.Close()
 
-	// Build the command - wrap with nsenter if in container
 	cmdArgs := []string{"runc", "exec", "portworx",
 		"thin_dump", "-m", "--dev-id", strconv.Itoa(thinID), tmetaDev}
 	wrappedArgs := wrapWithNsenter(cmdArgs)
@@ -1006,9 +1034,9 @@ func coalesceExtents(exts []Extent) []Extent {
 	return merged
 }
 
-func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
-	logWithTime("===== STEP 3/4: Build FA->backend mapping =====")
-	logWithTime("Step 3: building FA->backend mapping for destination PX volume %q", dstPxVol)
+func (m *migrator) runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
+	m.log("===== STEP 3/4: Build FA->backend mapping =====")
+	m.log("Step 3: building FA->backend mapping for destination PX volume %q", dstPxVol)
 
 	dstInfo, err := getPxVolInfoWithDevice(dstPxVol)
 	if err != nil {
@@ -1019,33 +1047,33 @@ func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("step3: getPoolPrefixAndThinID: %w", err)
 	}
-	logWithTime("Step 3: pool prefix=%s, thin dev ID=%d", poolPrefix, thinID)
+	m.log("Step 3: pool prefix=%s, thin dev ID=%d", poolPrefix, thinID)
 
 	thinXML, err := genThinDumpXML(poolPrefix, thinID, dstInfo.Name, dstInfo.VolID)
 	if err != nil {
 		return "", "", fmt.Errorf("step3: genThinDumpXML: %w", err)
 	}
-	logWithTime("Step 3: thin_dump xml written to %s", thinXML)
+	m.log("Step 3: thin_dump xml written to %s", thinXML)
 
 	tdataStartSector, err := getTdataStartSector(poolPrefix)
 	if err != nil {
 		return "", "", fmt.Errorf("step3: getTdataStartSector: %w", err)
 	}
-	logWithTime("Step 3: tdata_start_sector=%d", tdataStartSector)
+	m.log("Step 3: tdata_start_sector=%d", tdataStartSector)
 
 	mdDev, vg, err := getMDDeviceAndVG(poolPrefix)
 	if err != nil {
 		return "", "", fmt.Errorf("step3: getMDDeviceAndVG: %w", err)
 	}
-	logWithTime("Step 3: md device=%s (VG=%s)", mdDev, vg)
+	m.log("Step 3: md device=%s (VG=%s)", mdDev, vg)
 
 	mdChunkSizeBytes, members, err := getMDLayout(mdDev)
 	if err != nil {
 		return "", "", fmt.Errorf("step3: getMDLayout: %w", err)
 	}
-	logWithTime("Step 3: md chunk size=%d bytes, members=%d", mdChunkSizeBytes, len(members))
-	for i, m := range members {
-		logWithTime("Step 3: member[%d]=%s, data_offset_bytes=%d", i, m.Name, m.DataOffsetBytes)
+	m.log("Step 3: md chunk size=%d bytes, members=%d", mdChunkSizeBytes, len(members))
+	for i, mem := range members {
+		m.log("Step 3: member[%d]=%s, data_offset_bytes=%d", i, mem.Name, mem.DataOffsetBytes)
 	}
 
 	extFile := fmt.Sprintf("%s.extents", srcPxVol)
@@ -1066,12 +1094,12 @@ func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
 	detailedOut := fmt.Sprintf("%s_%s_%s_to_backend_map.txt", srcPxVol, dstInfo.Name, dstInfo.VolID)
 	aggOut := fmt.Sprintf("%s_%s_%s_aggregated_backend_map.txt", srcPxVol, dstInfo.Name, dstInfo.VolID)
 
-	logWithTime("Step 3: extents file=%s, detailed_out=%s, aggregated_out=%s", extFile, detailedOut, aggOut)
-	logWithTime("Step 3: thin_block_size=%d bytes, number_of_extents=%d", blockBytes, len(extents))
+	m.log("Step 3: extents file=%s, detailed_out=%s, aggregated_out=%s", extFile, detailedOut, aggOut)
+	m.log("Step 3: thin_block_size=%d bytes, number_of_extents=%d", blockBytes, len(extents))
 
 	backendExtents := make(map[string][]Extent)
-	for _, m := range members {
-		backendExtents[m.Name] = []Extent{}
+	for _, mem := range members {
+		backendExtents[mem.Name] = []Extent{}
 	}
 
 	start := time.Now()
@@ -1150,8 +1178,8 @@ func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
 	fmt.Fprintf(af, "# Dest PX vol: %s (ID: %s)\n", dstInfo.Name, dstInfo.VolID)
 	fmt.Fprintf(af, "# Src PX vol : %s\n\n", srcPxVol)
 
-	for _, m := range members {
-		name := m.Name
+	for _, mem := range members {
+		name := mem.Name
 		segs := backendExtents[name]
 		merged := coalesceExtents(segs)
 		fmt.Fprintf(af, "%s:\n", name)
@@ -1166,8 +1194,8 @@ func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
 	}
 
 	elapsed := time.Since(start).Seconds()
-	logWithTime("Step 3: mapping completed in %.1fs", elapsed)
-	logWithTime("Step 3: mapping complete. Detailed=%s, Aggregated=%s", detailedOut, aggOut)
+	m.log("Step 3: mapping completed in %.1fs", elapsed)
+	m.log("Step 3: mapping complete. Detailed=%s, Aggregated=%s", detailedOut, aggOut)
 	return detailedOut, aggOut, nil
 }
 
@@ -1175,6 +1203,7 @@ func runStep3BuildMapping(srcPxVol, dstPxVol string) (string, string, error) {
 // Step 4: Copy using XCOPY
 // -----------------------------
 
+// MapSegment represents a segment from the mapping file.
 type MapSegment struct {
 	Member string
 	SrcOff uint64
@@ -1183,9 +1212,25 @@ type MapSegment struct {
 	HdrIdx int
 }
 
+// CopyTask represents an XCOPY task.
+type CopyTask struct {
+	Member string
+	SrcOff uint64
+	DstOff uint64
+	Length uint64
+}
+
+// XcopyStats tracks XCOPY statistics.
+type XcopyStats struct {
+	SegmentsCompleted     uint64
+	TotalBytes            uint64
+	TotalXcopyInvocations uint64
+	TotalXcopyBlocks      uint64
+}
+
 var segRe = regexp.MustCompile(`segment\s+\d+:\s+member=(\S+),\s+logical_off=(\d+),\s+seg_len=(\d+),\s+backend_off=(\d+)`)
 
-func parseMappingFile(path string) ([]string, []MapSegment, error) {
+func parseMappingFile(path string, log LogFunc) ([]string, []MapSegment, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open mapping file: %w", err)
@@ -1227,7 +1272,7 @@ func parseMappingFile(path string) ([]string, []MapSegment, error) {
 		return nil, nil, err
 	}
 	if len(segments) == 0 {
-		logWithTime("Step 4: WARNING: no segments parsed from mapping file %s", path)
+		log("Step 4: WARNING: no segments parsed from mapping file %s", path)
 	}
 	return headers, segments, nil
 }
@@ -1243,13 +1288,6 @@ func getBlockSize(dev string) (int, error) {
 		return 0, fmt.Errorf("parse block size: %v", err)
 	}
 	return bs, nil
-}
-
-type CopyTask struct {
-	Member string
-	SrcOff uint64
-	DstOff uint64
-	Length uint64
 }
 
 func coalesceSegments(tasks []CopyTask) []CopyTask {
@@ -1285,14 +1323,12 @@ func coalesceSegments(tasks []CopyTask) []CopyTask {
 	return merged
 }
 
-func xcopySegment(srcDev, dstDev string, srcOff, dstOff, length uint64,
-	bs int, dryRun bool) error {
-
+func xcopySegment(srcDev, dstDev string, srcOff, dstOff, length uint64, bs int, log LogFunc) error {
 	if length == 0 {
 		return nil
 	}
 	if srcOff%uint64(bs) != 0 || dstOff%uint64(bs) != 0 || length%uint64(bs) != 0 {
-		logWithTime("Step 4: WARNING: XCOPY segment not %d-byte aligned (src_off=%d, dst_off=%d, len=%d) – skipping",
+		log("Step 4: WARNING: XCOPY segment not %d-byte aligned (src_off=%d, dst_off=%d, len=%d) – skipping",
 			bs, srcOff, dstOff, length)
 		return nil
 	}
@@ -1312,12 +1348,6 @@ func xcopySegment(srcDev, dstDev string, srcOff, dstOff, length uint64,
 		fmt.Sprintf("seek=%d", dstLBA),
 		fmt.Sprintf("count=%d", blocks),
 		"id_usage=disable",
-	}
-
-	if dryRun {
-		logWithTime("Step 4: XCOPY DRY-RUN: src_off=%d dst_off=%d len=%d (src_lba=%d, dst_lba=%d, blocks=%d)",
-			srcOff, dstOff, length, srcLBA, dstLBA, blocks)
-		return nil
 	}
 
 	// Wrap command appropriately based on environment
@@ -1346,22 +1376,12 @@ func xcopySegment(srcDev, dstDev string, srcOff, dstOff, length uint64,
 	return nil
 }
 
-type XcopyStats struct {
-	SegmentsCompleted     uint64
-	TotalBytes            uint64
-	TotalXcopyInvocations uint64
-	TotalXcopyBlocks      uint64
-}
-
-func runXcopyMultiWorker(
+func (m *migrator) runXcopyMultiWorker(
 	segments []CopyTask,
 	srcDev string,
 	xcopyBS int,
-	dryRun bool,
 	workers int,
-	statsInterval int,
 ) int {
-
 	if workers < 1 {
 		workers = 1
 	}
@@ -1396,9 +1416,9 @@ func runXcopyMultiWorker(
 				task.DstOff,
 				task.Length,
 				xcopyBS,
-				dryRun,
+				m.log,
 			); err != nil {
-				logWithTime("Step 4: ERROR: XCOPY failed for member=%s, src_off=%d, dst_off=%d, len=%d: %v",
+				m.log("Step 4: ERROR: XCOPY failed for member=%s, src_off=%d, dst_off=%d, len=%d: %v",
 					task.Member, task.SrcOff, task.DstOff, task.Length, err)
 				continue
 			}
@@ -1411,8 +1431,8 @@ func runXcopyMultiWorker(
 		go workerFn()
 	}
 
-	if statsInterval > 0 {
-		ticker := time.NewTicker(time.Duration(statsInterval) * time.Second)
+	if m.cfg.StatsInterval > 0 {
+		ticker := time.NewTicker(time.Duration(m.cfg.StatsInterval) * time.Second)
 		go func() {
 			defer ticker.Stop()
 			var prevSegDone uint64
@@ -1435,18 +1455,14 @@ func runXcopyMultiWorker(
 					throughputMiB = miB / elapsed
 				}
 
-				logWithTime(
-					"Step 4: [STATS] Elapsed: %.1fs, segments: %d/%d (+%d), bytes: %d (%.2f GiB), avg throughput: %.2f MiB/s",
-					elapsed, segDone, totalSegs, deltaSeg, bytes, giB, throughputMiB,
-				)
+				m.log("Step 4: [STATS] Elapsed: %.1fs, segments: %d/%d (+%d), bytes: %d (%.2f GiB), avg throughput: %.2f MiB/s",
+					elapsed, segDone, totalSegs, deltaSeg, bytes, giB, throughputMiB)
 
 				blocks := atomic.LoadUint64(&stats.TotalXcopyBlocks)
-				logWithTime(
-					"Step 4: [STATS] XCOPY so far: sg_xcopy_calls=%d, blocks=%d, bytes=%d",
+				m.log("Step 4: [STATS] XCOPY so far: sg_xcopy_calls=%d, blocks=%d, bytes=%d",
 					atomic.LoadUint64(&stats.TotalXcopyInvocations),
 					blocks,
-					blocks*uint64(xcopyBS),
-				)
+					blocks*uint64(xcopyBS))
 			}
 		}()
 	}
@@ -1464,21 +1480,20 @@ func runXcopyMultiWorker(
 		throughputMiB = miBTotal / elapsedTotal
 	}
 
-	logWithTime("Step 4: Total bytes via XCOPY: %d (%.2f GiB)", bytes, giBTotal)
-	logWithTime("Step 4: Elapsed time: %.1fs, average throughput: %.2f MiB/s", elapsedTotal, throughputMiB)
+	m.log("Step 4: Total bytes via XCOPY: %d (%.2f GiB)", bytes, giBTotal)
+	m.log("Step 4: Elapsed time: %.1fs, average throughput: %.2f MiB/s", elapsedTotal, throughputMiB)
 
 	blocks := atomic.LoadUint64(&stats.TotalXcopyBlocks)
-	logWithTime("Step 4: XCOPY stats: sg_xcopy_calls=%d, blocks=%d, bytes=%d",
+	m.log("Step 4: XCOPY stats: sg_xcopy_calls=%d, blocks=%d, bytes=%d",
 		atomic.LoadUint64(&stats.TotalXcopyInvocations),
 		blocks,
-		blocks*uint64(xcopyBS),
-	)
-	logWithTime("Step 4: XCOPY operations completed (sg_xcopy, multi-goroutine).")
+		blocks*uint64(xcopyBS))
+	m.log("Step 4: XCOPY operations completed (sg_xcopy, multi-goroutine).")
 	return 0
 }
 
-func runStep4CopyData(srcPxVol, dstPxVol string) error {
-	logWithTime("===== STEP 4/4: Copy data via XCOPY =====")
+func (m *migrator) runStep4CopyData(srcPxVol, dstPxVol string) error {
+	m.log("===== STEP 4/4: Copy data via XCOPY =====")
 
 	srcInfo, err := getPxVolInfoWithDevice(srcPxVol)
 	if err != nil {
@@ -1494,15 +1509,14 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 	copyLogFile := fmt.Sprintf("%s_%s_%s_copy_segments.txt",
 		srcPxVol, dstInfo.Name, dstInfo.VolID)
 
-	logWithTime("Step 4: Source PX vol: %s (arg: %s, ID: %s)", srcInfo.Name, srcPxVol, srcInfo.VolID)
-	logWithTime("Step 4: Source device path: %s", srcInfo.DevPath)
-	logWithTime("Step 4: Destination PX vol: %s (arg: %s, ID: %s)", dstInfo.Name, dstPxVol, dstInfo.VolID)
-	logWithTime("Step 4: Mapping file: %s", mappingFile)
-	logWithTime("Step 4: Copy log file: %s", copyLogFile)
-	logWithTime("Step 4: Dry run: %v", flagDryRun)
+	m.log("Step 4: Source PX vol: %s (arg: %s, ID: %s)", srcInfo.Name, srcPxVol, srcInfo.VolID)
+	m.log("Step 4: Source device path: %s", srcInfo.DevPath)
+	m.log("Step 4: Destination PX vol: %s (arg: %s, ID: %s)", dstInfo.Name, dstPxVol, dstInfo.VolID)
+	m.log("Step 4: Mapping file: %s", mappingFile)
+	m.log("Step 4: Copy log file: %s", copyLogFile)
 
 	if _, err := os.Stat(mappingFile); err != nil {
-		logWithTime("Failed to stat mapping file: %v", err)
+		m.log("Failed to stat mapping file: %v", err)
 		return fmt.Errorf("step4: mapping file '%s' not found", mappingFile)
 	}
 
@@ -1512,13 +1526,13 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 		return fmt.Errorf("step4: sg_xcopy not found in PATH")
 	}
 
-	headers, segments, err := parseMappingFile(mappingFile)
+	headers, segments, err := parseMappingFile(mappingFile, m.log)
 	if err != nil {
-		logWithTime("Failed to parse mapping file: %v", err)
+		m.log("Failed to parse mapping file: %v", err)
 		return fmt.Errorf("step4: parseMappingFile: %w", err)
 	}
 	if len(segments) == 0 {
-		logWithTime("Step 4: no segments to copy; exiting.")
+		m.log("Step 4: no segments to copy; exiting.")
 		return nil
 	}
 
@@ -1531,9 +1545,9 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 		memberDevs[s.Member] = struct{}{}
 	}
 
-	logWithTime("Step 4: Backend member devices referenced in mapping:")
+	m.log("Step 4: Backend member devices referenced in mapping:")
 	for d := range memberDevs {
-		logWithTime("Step 4:   %s", d)
+		m.log("Step 4:   %s", d)
 	}
 
 	srcBS, err := getBlockSize(srcInfo.DevPath)
@@ -1549,11 +1563,11 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 			return fmt.Errorf("step4: logical block size mismatch src=%d, %s=%d", srcBS, d, bs)
 		}
 	}
-	logWithTime("Step 4: XCOPY using logical block size %d bytes (from devices)", srcBS)
+	m.log("Step 4: XCOPY using logical block size %d bytes (from devices)", srcBS)
 
 	// summary only (no per-extent spam)
 	_ = segmentsPerHdr // kept in case we want richer summary later
-	logWithTime("Step 4: Logical extents: %d, backend segments: %d", len(headers), len(segments))
+	m.log("Step 4: Logical extents: %d, backend segments: %d", len(headers), len(segments))
 
 	// build CopyTask list & coalesce
 	baseSegs := make([]CopyTask, 0, len(segments))
@@ -1569,7 +1583,7 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 	}
 	coalesced := coalesceSegments(baseSegs)
 	giB := float64(totalBytes) / (1024.0 * 1024.0 * 1024.0)
-	logWithTime("Step 4: segments from mapping: %d, after coalesce: %d, total_bytes=%d (~%.2f GiB)",
+	m.log("Step 4: segments from mapping: %d, after coalesce: %d, total_bytes=%d (~%.2f GiB)",
 		len(baseSegs), len(coalesced), totalBytes, giB)
 
 	logF, err := os.Create(copyLogFile)
@@ -1584,9 +1598,9 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 			t.SrcOff, t.Length, t.Member, t.DstOff, blocks)
 	}
 	logF.Sync()
-	logWithTime("Step 4: detailed copy log will be written to: %s", copyLogFile)
+	m.log("Step 4: detailed copy log will be written to: %s", copyLogFile)
 
-	workers := flagJobs
+	workers := m.cfg.Jobs
 	if workers <= 0 {
 		workers = DefaultStep4Workers
 	}
@@ -1597,22 +1611,10 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 		workers = 1
 	}
 
-	logWithTime("Step 4: XCOPY worker goroutines: %d", workers)
+	m.log("Step 4: XCOPY worker goroutines: %d", workers)
 
-	statsInterval := flagStatsInterval
-	if statsInterval < 0 {
-		statsInterval = 0
-	}
-
-	ret := runXcopyMultiWorker(
-		coalesced,
-		srcInfo.DevPath,
-		srcBS,
-		flagDryRun,
-		workers,
-		statsInterval,
-	)
-	logWithTime("Step 4: Detailed copy log written to: %s", copyLogFile)
+	ret := m.runXcopyMultiWorker(coalesced, srcInfo.DevPath, srcBS, workers)
+	m.log("Step 4: Detailed copy log written to: %s", copyLogFile)
 
 	if devNull != nil {
 		devNull.Close()
@@ -1621,158 +1623,4 @@ func runStep4CopyData(srcPxVol, dstPxVol string) error {
 		return fmt.Errorf("step4: XCOPY run returned %d", ret)
 	}
 	return nil
-}
-
-// -----------------------------
-// Main / CLI
-// -----------------------------
-
-func usage() {
-	fmt.Fprintf(os.Stderr,
-		"Usage:\n"+
-			"  fa_pxd_migration [OPTIONS] <src_px_vol> <dst_px_vol>\n\n"+
-			"Pipeline steps:\n"+
-			"  1) Fetch FA diff extents and write <src>.extents\n"+
-			"  2) Poke PXD thin mapping on dst volume using extents\n"+
-			"  3) Build FA->backend mapping (detailed + aggregated files)\n"+
-			"  4) Copy data using XCOPY (sg_xcopy) with coalesced backend segments\n\n"+
-			"Options:\n"+
-			"  -dry-run           Global dry-run (no device writes / XCOPY)\n"+
-			"  -step N            Run only step N (1..4). Requires pre-req files from earlier steps.\n"+
-			"  -max-step N        Run steps 1..N (pipeline style). Deprecated; use -step.\n"+
-			"  -jobs N            XCOPY goroutines for step 4 (default: %d)\n"+
-			"  -step2-workers N   PXD poke workers for step 2 (default: %d, capped by #extents)\n"+
-			"  -stats-interval S  Stats interval in seconds for step 2 & step 4 (0 = disable)\n\n"+
-			"FlashArray:\n"+
-			"  -fa-ip string         FlashArray management IP/hostname (or FA_IP env)\n"+
-			"  -fa-api-ver string    FlashArray API version (e.g. 2.41) or FA_API_VER env\n"+
-			"  -fa-api-token string  FlashArray API token or FA_API_TOKEN env\n",
-		DefaultStep4Workers, DefaultStep2Workers)
-}
-
-func main() {
-	// env-based defaults for FA
-	envFaIP := os.Getenv("FA_IP")
-	envFaVer := os.Getenv("FA_API_VER")
-	envFaToken := os.Getenv("FA_API_TOKEN")
-
-	defaultFaIP := DefaultFAIP
-	if envFaIP != "" {
-		defaultFaIP = envFaIP
-	}
-	defaultFaVer := DefaultFAVersion
-	if envFaVer != "" {
-		defaultFaVer = envFaVer
-	}
-	defaultFaToken := DefaultFAToken
-	if envFaToken != "" {
-		defaultFaToken = envFaToken
-	}
-
-	flag.BoolVar(&flagDryRun, "dry-run", false, "Global dry-run (no device writes / XCOPY)")
-	flag.IntVar(&flagStep, "step", 0, "Run only step N (1..4). Requires pre-req files from earlier steps.")
-	flag.IntVar(&flagMaxStep, "max-step", 0, "Run steps 1..N (pipeline style). Deprecated; use -step.")
-	flag.IntVar(&flagJobs, "jobs", DefaultStep4Workers, "XCOPY goroutines for step 4")
-	flag.IntVar(&flagStep2Workers, "step2-workers", DefaultStep2Workers, "PXD poke workers for step 2")
-	flag.IntVar(&flagStatsInterval, "stats-interval", DefaultStatsInterval, "Stats interval in seconds for step 2 & step 4 (0=disable)")
-
-	flag.StringVar(&flagFaIP, "fa-ip", defaultFaIP, "FlashArray management IP/hostname (or FA_IP env)")
-	flag.StringVar(&flagFaAPIVer, "fa-api-ver", defaultFaVer, "FlashArray API version (e.g. 2.41) or FA_API_VER env")
-	flag.StringVar(&flagFaAPIToken, "fa-api-token", defaultFaToken, "FlashArray API token or FA_API_TOKEN env")
-
-	flag.Usage = usage
-	flag.Parse()
-
-	args := flag.Args()
-	if len(args) != 2 {
-		usage()
-		os.Exit(1)
-	}
-	srcPxVol := args[0]
-	dstPxVol := args[1]
-
-	if flagStep != 0 && flagMaxStep != 0 {
-		fmt.Fprintln(os.Stderr, "ERROR: -step and -max-step cannot both be set")
-		os.Exit(1)
-	}
-	if flagStep < 0 || flagStep > MaxStep {
-		fmt.Fprintf(os.Stderr, "ERROR: -step must be between %d and %d\n", MinStep, MaxStep)
-		os.Exit(1)
-	}
-	if flagMaxStep < 0 || flagMaxStep > MaxStep {
-		fmt.Fprintf(os.Stderr, "ERROR: -max-step must be between %d and %d\n", MinStep, MaxStep)
-		os.Exit(1)
-	}
-
-	startAll := time.Now()
-	logWithTime("Starting FADA->PX backend migration pipeline")
-	logWithTime("Source FADA PX volume: %s", srcPxVol)
-	logWithTime("Destination PXD PX volume: %s", dstPxVol)
-	logWithTime("Dry run: %v", flagDryRun)
-
-	var minStep, maxStep int
-	if flagStep > 0 {
-		minStep = flagStep
-		maxStep = flagStep
-		logWithTime("Will run only step %d", flagStep)
-	} else if flagMaxStep > 0 {
-		minStep = 1
-		maxStep = flagMaxStep
-		logWithTime("Will run steps %d..%d", minStep, maxStep)
-	} else {
-		minStep = 1
-		maxStep = MaxStep
-		logWithTime("Will run full pipeline steps %d..%d", minStep, maxStep)
-	}
-
-	shortToken := flagFaAPIToken
-	if len(shortToken) > 6 {
-		shortToken = shortToken[:6] + "..."
-	}
-	logWithTime("Using FlashArray: ip=%s, api_ver=%s (token: %s)", flagFaIP, flagFaAPIVer, shortToken)
-
-	// STEP 1
-	if minStep <= 1 && maxStep >= 1 {
-		if err := runStep1FetchExtents(srcPxVol); err != nil {
-			logWithTime("ERROR: Step 1 failed: %v", err)
-			os.Exit(1)
-		}
-	}
-
-	// STEP 2
-	if minStep <= 2 && maxStep >= 2 {
-		if err := runStep2PreparePxdMappings(srcPxVol, dstPxVol); err != nil {
-			logWithTime("ERROR: Step 2 failed: %v", err)
-			os.Exit(1)
-		}
-
-		// If we're continuing to Step 3, give the thin pool time to commit metadata
-		if maxStep >= 3 {
-			logWithTime("Waiting 2 seconds for thin pool metadata to be committed...")
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	// STEP 3
-	var mappingFile, aggFile string
-	if minStep <= 3 && maxStep >= 3 {
-		var err error
-		mappingFile, aggFile, err = runStep3BuildMapping(srcPxVol, dstPxVol)
-		if err != nil {
-			logWithTime("ERROR: Step 3 failed: %v", err)
-			os.Exit(1)
-		}
-		logWithTime("Step 3: mapping files: detailed=%s, aggregated=%s", mappingFile, aggFile)
-	}
-
-	// STEP 4
-	if minStep <= 4 && maxStep >= 4 {
-		if err := runStep4CopyData(srcPxVol, dstPxVol); err != nil {
-			logWithTime("ERROR: Step 4 failed: %v", err)
-			os.Exit(1)
-		}
-	}
-
-	elapsedAll := time.Since(startAll).Seconds()
-	logWithTime("All requested steps completed (dry_run=%v). Total elapsed: %.1f seconds", flagDryRun, elapsedAll)
 }

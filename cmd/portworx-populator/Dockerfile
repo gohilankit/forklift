@@ -14,11 +14,8 @@ RUN go mod download
 COPY pkg/ pkg/
 COPY cmd/portworx-populator/ cmd/portworx-populator/
 
-# Build portworx-populator binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o portworx-populator cmd/portworx-populator/portworx-populator.go
-
-# Build fa_pxd_migration binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o fa_pxd_migration ./cmd/portworx-populator/fa-pxd-migration
+# Build portworx-populator binary (includes integrated FADA->PXD migration)
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -a -o portworx-populator ./cmd/portworx-populator
 
 # Runtime stage
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
@@ -31,14 +28,12 @@ RUN microdnf install -y \
 
 WORKDIR /
 
-# Copy binaries from builder
+# Copy binary from builder
 COPY --from=builder /workspace/portworx-populator /usr/local/bin/portworx-populator
-COPY --from=builder /workspace/fa_pxd_migration /usr/local/bin/fa_pxd_migration
 
-# Make binaries executable
-RUN chmod +x /usr/local/bin/portworx-populator /usr/local/bin/fa_pxd_migration
+# Make binary executable
+RUN chmod +x /usr/local/bin/portworx-populator
 
 # Note: No USER directive - this container requires root for nsenter, mdadm, pxctl, etc.
 
 ENTRYPOINT ["/usr/local/bin/portworx-populator"]
-

@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"time"
 
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1"
@@ -112,7 +111,7 @@ func main() {
 		klog.Warningf("Failed to update CR status: %v", err)
 	}
 
-	// Run the fa_pxd_migration tool
+	// Run the FADA to PXD migration
 	klog.Info("Starting FADA to PXD data copy...")
 	if err := runFADAtoPXDCopy(sourcePV, destPV, faEndpoint, faAPIToken); err != nil {
 		updateCRStatus(k8sClient, "Failed", fmt.Sprintf("Data copy failed: %v", err), "50%")
@@ -249,33 +248,29 @@ func getFlashArrayAPIToken(hostname, username, password string) (string, error) 
 }
 
 func runFADAtoPXDCopy(sourcePV, destPV, faEndpoint, faAPIToken string) error {
-	klog.Infof("Running fa_pxd_migration: %s -> %s", sourcePV, destPV)
+	klog.Infof("Running FADA to PXD migration: %s -> %s", sourcePV, destPV)
 
-	// Set environment variables for FlashArray credentials
-	os.Setenv("FA_IP", faEndpoint)
-	os.Setenv("FA_ENDPOINT", faEndpoint)
-	os.Setenv("FA_API_TOKEN", faAPIToken)
-	os.Setenv("FA_API_VER", "2.41") //(2.41+ required for /volumes/diff)
+	// Configure the migration
+	cfg := DefaultConfig()
+	cfg.FAIP = faEndpoint
+	cfg.FAAPIToken = faAPIToken
+	cfg.FAAPIVer = "2.41" // 2.41+ required for /volumes/diff
+	cfg.Jobs = 512
+	cfg.Step2Workers = 16
+	cfg.StatsInterval = 30
 
-	// Run fa_pxd_migration tool
-	// fa_pxd_migration is in the container at /usr/local/bin/fa_pxd_migration
-	// It will use nsenter to run pxctl commands on the host
-	klog.Info("Starting fa_pxd_migration...")
-	cmd := exec.Command("fa_pxd_migration",
-		"-jobs", "512",
-		"-step2-workers", "16",
-		"-stats-interval", "30",
-		sourcePV,
-		destPV,
-	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("fa_pxd_migration failed: %w", err)
+	// Create a logger that integrates with klog
+	klogLogger := func(format string, args ...interface{}) {
+		klog.Infof(format, args...)
 	}
 
-	klog.Info("fa_pxd_migration completed successfully")
+	// Run the migration directly
+	klog.Info("Starting FADA to PXD migration...")
+	if err := RunMigrationWithLogger(sourcePV, destPV, cfg, klogLogger); err != nil {
+		return fmt.Errorf("FADA to PXD migration failed: %w", err)
+	}
+
+	klog.Info("FADA to PXD migration completed successfully")
 	return nil
 }
 
