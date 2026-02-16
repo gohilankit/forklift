@@ -42,7 +42,6 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 	core "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1393,18 +1392,23 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 						"the offload plugin configuration has missing details, cannot continue with PVC and populator resource creation")
 				}
 
-				// Check if destination StorageClass is non-FADA for Pure FlashArray
+				// Check if destination StorageClass requires intermediate storage
+				var needsIntermediateVolume bool
 				var targetStorageClass string
-				if storageVendorProduct == api.StorageVendorProductPureFlashArray {
-					isFADA, err := r.isStorageClassFADA(storageClass)
+				provisioner, err := r.getVolumeProvisioner()
+				if err != nil {
+					r.Log.Error(err, "Failed to get volume provisioner, skipping intermediate storage check")
+				} else if provisioner != nil {
+					needsIntermediateVolume, err = provisioner.NeedsIntermediateVolume(storageClass)
 					if err != nil {
-						r.Log.Error(err, "Failed to check if StorageClass is FADA, assuming it is FADA", "storageClass", storageClass)
-					} else if !isFADA {
-						// Non-FADA destination detected, will need PXD handoff
+						r.Log.Error(err, "Failed to check if it needs intermediate storage", "storageClass", storageClass)
+					} else if needsIntermediateVolume {
+						// Destination StorageClass requires intermediate storage
 						targetStorageClass = storageClass
-						storageClass = "fada"
-						r.Log.Info("Detected non-FADA destination StorageClass for Pure FlashArray, will use FADA intermediate storage",
-							"targetStorageClass", targetStorageClass)
+						storageClass = provisioner.GetIntermediateStorageClass()
+						r.Log.Info("Detected destination StorageClass requires intermediate storage",
+							"targetStorageClass", targetStorageClass,
+							"intermediateStorageClass", storageClass)
 					}
 				}
 
@@ -1541,16 +1545,14 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 					return nil, err
 				}
 
-				// If we have a target storage class set, there is a need for additional storage vendor
-				// specific provisioning. The provisioned volume will be rebinded to the original PVC after the copy is complete.
-				if targetStorageClass != "" {
-					// Get storage-specific provisioner
+				// If intermediate storage is being used, provision final volume (and correponding populator)
+				if needsIntermediateVolume && targetStorageClass != "" {
 					provisioner, err := r.getVolumeProvisioner()
 					if err != nil {
 						return nil, liberr.Wrap(err, "failed to get volume provisioner")
 					}
 
-					if provisioner != nil && provisioner.NeedsAdditionalVolumes(createdPVC, targetStorageClass) {
+					if provisioner != nil {
 						r.Log.Info("Provisioning additional volumes for storage backend",
 							"pvc", createdPVC.Name,
 							"targetStorageClass", targetStorageClass)
@@ -2329,31 +2331,6 @@ func (r *Builder) generatePopulatorSuffix(migrationUID, vmID string, diskKey int
 	input := fmt.Sprintf("%s-%s-%d-%s-%d", migrationUID, vmID, diskKey, diskFile, diskIndex)
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])[:8]
-}
-
-// isStorageClassFADA checks if a StorageClass is Pure FlashArray Direct Access (FADA)
-// by examining its parameters for backend="pure_block" or backend="pure_file"
-func (r *Builder) isStorageClassFADA(storageClassName string) (bool, error) {
-	// Get the StorageClass object
-	storageClass := &storagev1.StorageClass{}
-	err := r.Destination.Client.Get(context.TODO(), client.ObjectKey{
-		Name: storageClassName,
-	}, storageClass)
-	if err != nil {
-		return false, fmt.Errorf("failed to get StorageClass %s: %w", storageClassName, err)
-	}
-
-	// Check if the backend parameter is pure_block or pure_file
-	if storageClass.Parameters != nil {
-		backend, exists := storageClass.Parameters["backend"]
-		if exists && (backend == "pure_block" || backend == "pure_file") {
-			r.Log.Info("StorageClass is FADA", "storageClass", storageClassName, "backend", backend)
-			return true, nil
-		}
-	}
-
-	r.Log.Info("StorageClass is not FADA", "storageClass", storageClassName)
-	return false, nil
 }
 
 // getVolumeProvisioner returns a storage-backend-specific volume provisioner

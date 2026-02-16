@@ -22,7 +22,6 @@ import (
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/plan"
 	"github.com/kubev2v/forklift/pkg/apis/forklift/v1beta1/ref"
 	"github.com/kubev2v/forklift/pkg/controller/plan/adapter"
-	"github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	inspectionparser "github.com/kubev2v/forklift/pkg/controller/plan/adapter/vsphere"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
@@ -896,31 +895,32 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 		return
 	}
 
-	// Build a map of FADA PVCs that have bound PXD targets (to filter them out)
-	// and collect annotations to copy to PXD PVCs
-	fadaToSkip := make(map[string]bool)
-	fadaAnnotations := make(map[string]map[string]string) // targetPVCName -> annotations to copy
+	// Build a map of intermediate PVCs that have bound target PVCs (to filter them out)
+	// and collect annotations to copy to target PVCs
+	intermediatePVCsToSkip := make(map[string]bool)
+	intermediateAnnotations := make(map[string]map[string]string) // targetPVCName -> annotations to copy
 
 	for i := range pvcsList.Items {
 		pvc := &pvcsList.Items[i]
 		if targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]; targetPVCName != "" {
-			// This is a FADA PVC with a target PXD PVC
-			// Check if target PXD PVC is bound
+			// This is an intermediate PVC with a target PVC
+			// Check if target PVC is bound
 			targetPVC := &core.PersistentVolumeClaim{}
 			targetErr := r.Destination.Client.Get(
 				context.TODO(),
 				client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
 				targetPVC)
 			if targetErr == nil && targetPVC.Status.Phase == core.ClaimBound {
-				// Target PXD PVC is bound, mark FADA PVC to be skipped
-				fadaToSkip[pvc.Name] = true
-				// Store annotations to copy to PXD PVC
-				fadaAnnotations[targetPVCName] = map[string]string{}
-				if source, ok := pvc.Annotations[base.AnnDiskSource]; ok {
-					fadaAnnotations[targetPVCName][base.AnnDiskSource] = source
-				}
-				if backingFile, ok := pvc.Annotations[base.AnnImportBackingFile]; ok {
-					fadaAnnotations[targetPVCName][base.AnnImportBackingFile] = backingFile
+				// Target PVC is bound, mark intermediate PVC to be skipped
+				intermediatePVCsToSkip[pvc.Name] = true
+				// Store ALL annotations to copy to target PVC (not just specific ones)
+				// This ensures annotations like AnnSourceFormat are preserved for ImageConversion
+				intermediateAnnotations[targetPVCName] = make(map[string]string)
+				for k, v := range pvc.Annotations {
+					// Copy all annotations except internal ones
+					if !strings.HasPrefix(k, "forklift.konveyor.io/target-") {
+						intermediateAnnotations[targetPVCName][k] = v
+					}
 				}
 			}
 		}
@@ -930,18 +930,20 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 	for i := range pvcsList.Items {
 		pvc := &pvcsList.Items[i]
 
-		// Skip FADA PVCs that have bound PXD targets
-		if fadaToSkip[pvc.Name] {
+		// Skip intermediate PVCs that have bound target PVCs
+		if intermediatePVCsToSkip[pvc.Name] {
 			continue
 		}
 
-		// If this is a PXD PVC, copy annotations from its FADA source
-		if annotations, ok := fadaAnnotations[pvc.Name]; ok {
+		// If this is a target PVC, copy annotations from its intermediate source
+		if annotations, ok := intermediateAnnotations[pvc.Name]; ok {
 			if pvc.Annotations == nil {
 				pvc.Annotations = make(map[string]string)
 			}
 			for k, v := range annotations {
-				pvc.Annotations[k] = v
+				if _, exists := pvc.Annotations[k]; !exists {
+					pvc.Annotations[k] = v
+				}
 			}
 		}
 
@@ -958,10 +960,10 @@ func (r *KubeVirt) getPVCs(vmRef ref.Ref) (pvcs []*core.PersistentVolumeClaim, e
 	return
 }
 
-// DeleteFADAPVCs deletes FADA PVCs that have been replaced by bound PXD PVCs.
-// This should be called after the VM is created with PXD PVCs.
-func (r *KubeVirt) DeleteFADAPVCs(vm *plan.VMStatus) error {
-	// Query all PVCs directly (not using getPVCs which filters out FADA PVCs)
+// DeleteIntermediatePVCs deletes intermediate PVCs that have been replaced by bound target PVCs.
+// Only deletes PVCs that have "forklift.konveyor.io/target-pvc-name" annotation. If a PVC doesn't have this annotation, it's skipped.
+// This should be called after the VM is created with target PVCs.
+func (r *KubeVirt) DeleteIntermediatePVCs(vm *plan.VMStatus) error {
 	pvcsList := &core.PersistentVolumeClaimList{}
 	labelSelector := map[string]string{
 		kVM: vm.Ref.ID,
@@ -988,33 +990,59 @@ func (r *KubeVirt) DeleteFADAPVCs(vm *plan.VMStatus) error {
 			continue
 		}
 
-		// Check if target PXD PVC is bound
+		// Check if target PVC is bound
 		targetPVC := &core.PersistentVolumeClaim{}
 		err := r.Destination.Client.Get(
 			context.TODO(),
 			client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
 			targetPVC)
 		if err != nil {
-			r.Log.Error(err, "Failed to get target PXD PVC", "pvc", targetPVCName)
+			r.Log.Error(err, "Failed to get target PVC", "pvc", targetPVCName)
 			continue
 		}
 
 		if targetPVC.Status.Phase != core.ClaimBound {
-			r.Log.Info("Target PXD PVC not bound yet, skipping FADA PVC deletion",
-				"fadaPVC", pvc.Name,
-				"pxdPVC", targetPVCName,
+			r.Log.Info("Target PVC not bound yet, skipping intermediate PVC deletion",
+				"intermediatePVC", pvc.Name,
+				"targetPVC", targetPVCName,
 				"phase", targetPVC.Status.Phase)
 			continue
 		}
 
-		// Delete the FADA PVC
-		r.Log.Info("Deleting FADA PVC replaced by PXD PVC",
-			"fadaPVC", pvc.Name,
-			"pxdPVC", targetPVCName)
+		// Delete the populator pod associated with the target PVC first
+		// This ensures the pod doesn't block PVC deletion
+		populatorPodName := fmt.Sprintf("populate-%s", targetPVC.UID)
+		populatorPod := &core.Pod{}
+		err = r.Destination.Client.Get(
+			context.TODO(),
+			types.NamespacedName{
+				Name:      populatorPodName,
+				Namespace: r.Plan.Spec.TargetNamespace,
+			},
+			populatorPod)
+		if err == nil {
+			r.Log.Info("Deleting populator pod for intermediate PVC",
+				"pod", populatorPodName,
+				"intermediatePVC", pvc.Name,
+				"targetPVC", targetPVCName)
+			err = r.Destination.Client.Delete(context.TODO(), populatorPod)
+			if err != nil && !k8serr.IsNotFound(err) {
+				r.Log.Error(err, "Failed to delete populator pod", "pod", populatorPodName)
+				return err
+			}
+		} else if !k8serr.IsNotFound(err) {
+			r.Log.Error(err, "Failed to get populator pod", "pod", populatorPodName)
+			return err
+		}
+
+		// Delete the intermediate PVC
+		r.Log.Info("Deleting intermediate PVC replaced by target PVC",
+			"intermediatePVC", pvc.Name,
+			"targetPVC", targetPVCName)
 		err = r.Destination.Client.Delete(context.TODO(), pvc)
 		if err != nil {
 			if !k8serr.IsNotFound(err) {
-				r.Log.Error(err, "Failed to delete FADA PVC", "pvc", pvc.Name)
+				r.Log.Error(err, "Failed to delete intermediate PVC", "pvc", pvc.Name)
 				return err
 			}
 		}

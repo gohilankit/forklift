@@ -959,8 +959,9 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				err = liberr.Wrap(err)
 				return
 			}
-			// Delete FADA PVCs that have been replaced by PXD PVCs (Pure/Portworx migrations)
-			err = r.kubevirt.DeleteFADAPVCs(vm)
+			// Delete intermediate PVCs that have been replaced by target PVCs (multi-stage migrations)
+			// No-op if it's not a multi-stage migration
+			err = r.kubevirt.DeleteIntermediatePVCs(vm)
 			if err != nil {
 				err = liberr.Wrap(err)
 				return

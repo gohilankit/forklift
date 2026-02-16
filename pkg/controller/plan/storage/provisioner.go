@@ -8,10 +8,16 @@ import (
 // Different storage backends (Pure/Portworx, NetApp, Dell, etc.) can implement this interface
 // to handle their specific multi-stage volume provisioning workflows.
 type VolumeProvisioner interface {
-	// NeedsAdditionalVolumes checks if any PVC requires additional volumes for this storage backend.
-	// For example, Pure/Portworx needs both FADA (intermediate) and PXD (final) volumes.
-	// Returns true if additional volumes are needed, false otherwise.
-	NeedsAdditionalVolumes(pvc *core.PersistentVolumeClaim, storageClass string) bool
+	// NeedsIntermediateVolume checks if a destination storage class requires intermediate storage.
+	// For example, Pure FlashArray non-direct-access storage classes (like Portworx) need
+	// direct-access storage as an intermediate step.
+	// Returns true if intermediate storage is needed, false otherwise.
+	NeedsIntermediateVolume(destinationStorageClass string) (bool, error)
+
+	// GetIntermediateStorageClass returns the storage class name to use for intermediate storage.
+	// For example, Pure FlashArray returns its direct-access storage class name.
+	// Returns empty string if no intermediate storage is needed.
+	GetIntermediateStorageClass() string
 
 	// EnsureServiceAccount creates any storage-specific ServiceAccounts with required permissions.
 	// For example, portworx-populator needs a ServiceAccount with access to portworx SCC.
@@ -19,7 +25,7 @@ type VolumeProvisioner interface {
 	EnsureServiceAccount(namespace string) error
 
 	// ProvisionAdditionalVolumes creates any additional PVCs and CRs needed for this storage backend.
-	// For example, for Pure/Portworx, this creates the PXD PVC and PortworxVolumePopulator CR.
+	// For example, for Pure/Portworx, this creates the final PVC and PortworxVolumePopulator CR.
 	// Returns error if provisioning fails.
 	ProvisionAdditionalVolumes(sourcePVC *core.PersistentVolumeClaim, targetStorageClass string, diskSecretName string) error
 }

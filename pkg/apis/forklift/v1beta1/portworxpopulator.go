@@ -21,7 +21,7 @@ type PortworxVolumePopulator struct {
 }
 
 type PortworxVolumePopulatorSpec struct {
-	// SourcePvc is the name of the source PVC (FADA PVC)
+	// SourcePvc is the name of the source PVC
 	SourcePvc string `json:"sourcePvc"`
 	// SourceNamespace is the namespace of the source PVC
 	SourceNamespace string `json:"sourceNamespace"`
@@ -48,4 +48,3 @@ type PortworxVolumePopulatorList struct {
 func init() {
 	SchemeBuilder.Register(&PortworxVolumePopulator{}, &PortworxVolumePopulatorList{})
 }
-
