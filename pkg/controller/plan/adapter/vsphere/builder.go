@@ -25,6 +25,7 @@ import (
 	basecontroller "github.com/kubev2v/forklift/pkg/controller/base"
 	planbase "github.com/kubev2v/forklift/pkg/controller/plan/adapter/base"
 	plancontext "github.com/kubev2v/forklift/pkg/controller/plan/context"
+	"github.com/kubev2v/forklift/pkg/controller/plan/storage"
 	utils "github.com/kubev2v/forklift/pkg/controller/plan/util"
 	"github.com/kubev2v/forklift/pkg/controller/provider/model/vsphere"
 	"github.com/kubev2v/forklift/pkg/controller/provider/web"
@@ -1357,6 +1358,26 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 						"the offload plugin configuration has missing details, cannot continue with PVC and populator resource creation")
 				}
 
+				// Check if destination StorageClass requires intermediate storage
+				var needsIntermediateVolume bool
+				var targetStorageClass string
+				provisioner, err := r.getVolumeProvisioner()
+				if err != nil {
+					r.Log.Error(err, "Failed to get volume provisioner, skipping intermediate storage check")
+				} else if provisioner != nil {
+					needsIntermediateVolume, err = provisioner.NeedsIntermediateVolume(storageClass)
+					if err != nil {
+						r.Log.Error(err, "Failed to check if it needs intermediate storage", "storageClass", storageClass)
+					} else if needsIntermediateVolume {
+						// Destination StorageClass requires intermediate storage
+						targetStorageClass = storageClass
+						storageClass = provisioner.GetIntermediateStorageClass()
+						r.Log.Info("Detected destination StorageClass requires intermediate storage",
+							"targetStorageClass", targetStorageClass,
+							"intermediateStorageClass", storageClass)
+					}
+				}
+
 				namespace := r.Plan.Spec.TargetNamespace
 				labels := map[string]string{
 					"migration": string(r.Migration.UID),
@@ -1491,6 +1512,25 @@ func (r *Builder) PopulatorVolumes(vmRef ref.Ref, annotations map[string]string,
 				}, createdPVC)
 				if err != nil {
 					return nil, err
+				}
+
+				// If intermediate storage is being used, provision final volume (and correponding populator)
+				if needsIntermediateVolume && targetStorageClass != "" {
+					provisioner, err := r.getVolumeProvisioner()
+					if err != nil {
+						return nil, liberr.Wrap(err, "failed to get volume provisioner")
+					}
+
+					if provisioner != nil {
+						r.Log.Info("Provisioning additional volumes for storage backend",
+							"pvc", createdPVC.Name,
+							"targetStorageClass", targetStorageClass)
+
+						err = provisioner.ProvisionAdditionalVolumes(createdPVC, targetStorageClass, diskSecretName)
+						if err != nil {
+							return nil, liberr.Wrap(err, "failed to provision additional volumes")
+						}
+					}
 				}
 
 				vp.OwnerReferences[0].UID = createdPVC.UID
@@ -2277,6 +2317,12 @@ func (r *Builder) generatePopulatorSuffix(migrationUID, vmID string, diskKey int
 	input := fmt.Sprintf("%s-%s-%d-%s-%d", migrationUID, vmID, diskKey, diskFile, diskIndex)
 	hash := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(hash[:])[:8]
+}
+
+// getVolumeProvisioner returns a storage-backend-specific volume provisioner
+// based on the plan context. Returns nil if no additional provisioning is needed.
+func (r *Builder) getVolumeProvisioner() (storage.VolumeProvisioner, error) {
+	return storage.NewProvisioner(r.Context)
 }
 
 func (r *Builder) ensureXCopyVolumePopulator(vp *api.VSphereXcopyVolumePopulator) error {

@@ -409,6 +409,9 @@ func (r *Migration) cleanup(vm *plan.VMStatus, failOnErr func(error) bool) error
 		if err := r.kubevirt.DeleteVM(vm); failOnErr(err) {
 			return err
 		}
+		if err := r.kubevirt.DeleteIntermediatePVCs(vm); failOnErr(err) {
+			return err
+		}
 		if err := r.deletePopulatorPVCs(vm); failOnErr(err) {
 			return err
 		}
@@ -949,6 +952,13 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				return
 			}
 			err = r.deleteImporterPods(vm)
+			if err != nil {
+				err = liberr.Wrap(err)
+				return
+			}
+			// Delete intermediate PVCs that have been replaced by target PVCs (multi-stage migrations)
+			// No-op if it's not a multi-stage migration
+			err = r.kubevirt.DeleteIntermediatePVCs(vm)
 			if err != nil {
 				err = liberr.Wrap(err)
 				return
@@ -1892,6 +1902,48 @@ func (r *Migration) updatePopulatorCopyProgress(vm *plan.VMStatus, step *plan.St
 
 		taskSeen[taskName] = true
 
+		// Check if this PVC has a target PVC for rebinding and is bound
+		targetPVCName := pvc.Annotations["forklift.konveyor.io/target-pvc-name"]
+
+		if targetPVCName != "" {
+			// This PVC needs to be replaced by a target PVC
+			// Check if target PVC is bound to mark task complete
+			targetPVC := &core.PersistentVolumeClaim{}
+			err = r.Destination.Client.Get(
+				context.TODO(),
+				client.ObjectKey{Namespace: pvc.Namespace, Name: targetPVCName},
+				targetPVC)
+			if err != nil {
+				// Target PVC not found yet, keep waiting
+				r.Log.Info("Waiting for target PVC to be created",
+					"sourcePVC", pvc.Name,
+					"targetPVC", targetPVCName)
+				continue
+			}
+
+			if targetPVC.Status.Phase == core.ClaimBound {
+				// Target PVC is bound, mark task as completed
+				// Actual rebinding will happen after step completes
+				r.Log.Info("Target PVC is bound, marking task complete",
+					"sourcePVC", pvc.Name,
+					"targetPVC", targetPVCName)
+
+				task.Phase = api.StepCompleted
+				task.Reason = TransferCompleted
+				task.Progress.Completed = task.Progress.Total
+				task.MarkCompleted()
+				continue
+			} else {
+				// Target PVC exists but not bound yet, keep waiting
+				r.Log.Info("Waiting for target PVC to bind",
+					"targetPVC", targetPVCName,
+					"phase", targetPVC.Status.Phase)
+				// TODO: Get progress from volume populator status if available
+				continue
+			}
+		}
+
+		// Normal PVC flow (no rebinding needed)
 		if pvc.Status.Phase == core.ClaimBound {
 			task.Phase = api.StepCompleted
 			task.Reason = TransferCompleted
